@@ -1,0 +1,70 @@
+Form Studio 1.0 — 2026-10-24
+
+PASS: Python integration tests against a mock local LM Studio server and real
+CadQuery 2.7.0 (Linux, Python 3.12).
+- PNG photo included in the vision request.
+- First invalid CAD response rejected; second response corrected and exported.
+- Real 80 x 40 x 8 mm solid exported to STEP/STL.
+- STEP reimported and checked for validity and thickness.
+- Conversational revision retained the 8 mm thickness and changed hole spacing.
+- Current source, reference image, and three CAD views included on next turn.
+- Direct parameter change rebuilt width to 100 mm without model inference.
+- Restore retained all versions; a later failed revision retained active geometry.
+- Clarifying question returned without creating a CAD version.
+- An unloaded model was refused without requesting load/unload.
+- Active builder receipt blocked inference; accepted receipt allowed it.
+- Local URL, request-token, traversal and CAD AST checks passed.
+
+PASS: JavaScript syntax checks and STL viewer parser checks (binary/ASCII,
+finite normals, model bounds, and invalid-file rejection).
+
+PASS: Real sample bracket exported (80 x 40 x 5 mm, one valid solid) and
+rendered into isometric, top and front PNGs using the stdlib depth renderer.
+The isometric render was visually inspected after correcting depth ordering.
+
+Browser QA: Layout, startup, settings entry/save, project creation and sample
+job/error recovery were exercised in Chrome through the managed preview.
+The preview has no WebGL and cannot access the host's CadQuery interpreter.
+Orbit rendering and CAD execution through that preview therefore remain
+unverified; real worker execution was checked separately above.
+
+NOT TESTED: Windows launcher on the user's PC; that PC's exact Python 3.14 /
+CadQuery environment; real LM Studio/Qwen inference or model photo perception;
+Windows Task Scheduler queries. No access to that machine was available.
+The app has not been installed on the user's PC or connected to TRELLIS.2.
+
+No dependency installation, cloud hosting, model load/unload, LM Studio setting
+change, or existing overnight-ai workspace mutation was performed.
+
+Form Studio 1.1 — 2026-10-24 (review and repair by Claude)
+Fixed:
+- Static files served with explicit types (Windows registry can map .js to text/plain, which blanks the page).
+- Runner guard read fields the runner doesn't write; now uses run_night.pid (live process check, never os.kill on Windows), recent receipts' feature_state, and the scheduled task.
+- Qwen thinking switched off per request (runner's NO_THINK), so the reply budget goes to code.
+- Reply protocol: message + one ```python block; JSON still accepted (strict=False for raw newlines); truncated code is retried.
+- CadQuery allowlist: added slot2D, offset2D, sketch API, polarLine, each, append/extend, bounding-box fields and similar common calls.
+- Failed or stopped chat turns now add an assistant note, so roles stay alternating.
+- Static/image MIME types no longer depend on the Windows registry.
+Added: Load model (runner's settings via lms), Stop (closes the socket even during prompt processing), Quit, single-instance app window (Chrome/Edge --app), desktop + Start menu shortcuts via Install-Form-Studio.cmd, app icon, error dialog/log when started without a console.
+PASS: 10 integration tests (Linux, Python 3.13, CadQuery 2.8.0) + viewer checks.
+
+Form Studio 1.2 — 2026-10-24
+Real runs on the PC (RTX 3090, LM Studio, CadQuery 2.x in cadenv):
+- Installer, desktop shortcut, single-instance window, Quit, Load (Flash-Next 70 s, 27B 30 s) all worked.
+- Flash-Next was text-only (no mmproj); vision file downloaded, LM Studio now reports vision for both models.
+- Grip test with 27B exposed: translate(x, y, z) calls, try/except blocked, errors without line numbers, XZ extrusion toward -Y, holes outside the part, "fixes" that changed nothing. Fixed via worker leniency, line-numbered errors, prompt tips, and the measured self-check.
+Added: self-check with measured defects, Make printable (lay flat, split, dowels), Print files zip, Open in Bambu, Compare, Mesh mode (TRELLIS.2 via ComfyUI), phone access with passcode.
+PASS: 20 integration tests (Linux, Python 3.13, CadQuery 2.8.0; mock LM Studio and mock ComfyUI) + viewer checks.
+
+1.3: Mesh mode reads the shipped editor workflow (workflows/trellis2_mesh.json) and converts it to API format at run time with ComfyUI's /object_info (seed control values, linked widgets, reroutes, newer inputs defaulted). Only nodes feeding Trellis2ExportMesh are queued. Tested against ComfyUI-Trellis2 b0e84c0 node definitions.
+
+1.4 (Oct 24, 2026): photo measuring, Point/Measure in the viewer, templates, print fit, estimates, Slice → Bambu, CAD edits on meshes, Variations + scheduling, phone camera, project delete.
+On the PC (Windows, Python 3.14 cadenv, Bambu Studio 02.08.02.61, ComfyUI 0.30 portable, RTX 3090):
+- OpenCV auto-installed into cadenv in the background (opencv-python-headless 4.11.0.86, --no-deps); reference card PDF generated; measuring a photo without the card reports "card not found".
+- Viewer: Measure gave 102.02 mm (ΔX 102.0) across a 102 mm face; Point mode chip showed X/Y/Z and "faces +Z" for a top-face click.
+- Slice → Bambu: real bambu-studio.exe CLI with flattened X2D presets sliced the grip: 42 min, 32.2 g PLA (the browser's rough estimate said ~32 g).
+- Mesh mode: found that ComfyUI's Python lacked onnxruntime (rembg then calls sys.exit inside the worker and the job hangs forever) and lacked flash-attn/xformers (sparse attention). Form Studio now checks and installs onnxruntime 1.22.1 and xformers 0.0.34 (PyTorch cu130 index, --no-deps) before starting ComfyUI, and switches TRELLIS.2 to sdpa + xformers when flash-attn is absent. ComfyUI runs unbuffered and its latest progress line is shown in the job status. The workflow skips the slow quad remesh pass.
+- 27B grip test after the prompt/fillet/self-check fixes: one solid, 100 x 25 x 54 mm, flat top with both holes, deep-to-shallow wedge (no hollow skeleton).
+In the container: 28 integration tests pass (Linux, Python 3.13, CadQuery 2.8.0, OpenCV 4.11; mock LM Studio, mock ComfyUI, fake bambu-studio).
+- Mesh mode end to end on the grip photo: ~5 min TRELLIS.2 run, 100 x 29.2 x 52.9 mm, 200k triangles; the raw mesh had stacked/leaky triangles, so it was rebuilt watertight (voxel + VTK flying edges + smoothing + decimation). The quad-remesh workflow pass was kept (it removes floaters and inner faces and was faster overall).
+- CAD edit on that mesh with 27B: "two 5.3 mm holes, 40 mm apart, through the top flange" -> cut solids applied with manifold3d; volume dropped by 429 mm^3 (two 5.3 mm x ~9.7 mm holes); HOLE_D/HOLE_SPACING became editable parameters.

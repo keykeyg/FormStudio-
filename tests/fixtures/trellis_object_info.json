@@ -1,0 +1,972 @@
+{
+"Trellis2LoadModel": {
+"input": {
+"required": {
+"modelname": [
+[
+"microsoft/TRELLIS.2-4B",
+"visualbruno/TRELLIS.2-4B-FP8",
+"TencentARC/Pixal3D"
+],
+{
+"default": "microsoft/TRELLIS.2-4B"
+}
+],
+"backend": [
+[
+"flash_attn",
+"xformers",
+"sdpa",
+"flash_attn_3"
+],
+{
+"default": "flash_attn"
+}
+],
+"device": [
+[
+"cpu",
+"cuda"
+],
+{
+"default": "cuda"
+}
+],
+"low_vram": [
+"BOOLEAN",
+{
+"default": true
+}
+],
+"keep_models_loaded": [
+"BOOLEAN",
+{
+"default": true
+}
+],
+"conv_backend": [
+[
+"spconv",
+"torchsparse",
+"flex_gemm"
+],
+{
+"default": "flex_gemm"
+}
+],
+"sparse_backend": [
+[
+"xformers",
+"flash_attn"
+],
+{
+"default": "flash_attn"
+}
+],
+"use_reconviagen": [
+"BOOLEAN",
+{
+"default": false
+}
+],
+"pixal3d_multiview": [
+"BOOLEAN",
+{
+"default": false,
+"tooltip": "Pixal3D only: load the multi-view denoisers (pipeline_mv.json / ckpts/*_mv) instead of the single-view ones"
+}
+]
+}
+},
+"input_order": {
+"required": [
+"modelname",
+"backend",
+"device",
+"low_vram",
+"keep_models_loaded",
+"conv_backend",
+"sparse_backend",
+"use_reconviagen",
+"pixal3d_multiview"
+]
+},
+"output_node": true
+},
+"Trellis2SimplifyMesh": {
+"input": {
+"required": {
+"mesh": [
+"MESHWITHVOXEL"
+],
+"target_face_num": [
+"INT",
+{
+"default": 1000000,
+"min": 1,
+"max": 30000000
+}
+],
+"method": [
+[
+"Cumesh",
+"Meshlib"
+],
+{
+"default": "Cumesh"
+}
+]
+}
+},
+"input_order": {
+"required": [
+"mesh",
+"target_face_num",
+"method"
+]
+},
+"output_node": true
+},
+"Trellis2MeshWithVoxelToTrimesh": {
+"input": {
+"required": {
+"mesh": [
+"MESHWITHVOXEL"
+],
+"reorient_vertices": [
+[
+"None",
+"90 degrees",
+"-90 degrees"
+],
+{
+"default": "90 degrees"
+}
+]
+}
+},
+"input_order": {
+"required": [
+"mesh",
+"reorient_vertices"
+]
+},
+"output_node": true
+},
+"Trellis2ExportMesh": {
+"input": {
+"required": {
+"trimesh": [
+"TRIMESH"
+],
+"filename_prefix": [
+"STRING",
+{
+"default": "3D/Trellis2"
+}
+],
+"file_format": [
+[
+"glb",
+"obj",
+"ply",
+"stl",
+"3mf",
+"dae"
+]
+]
+}
+},
+"input_order": {
+"required": [
+"trimesh",
+"filename_prefix",
+"file_format"
+]
+},
+"output_node": true
+},
+"Trellis2ReconstructMeshWithQuad": {
+"input": {
+"required": {
+"mesh": [
+"MESHWITHVOXEL"
+],
+"remesh_band": [
+"FLOAT",
+{
+"default": 1.0
+}
+],
+"resolution": [
+[
+128,
+256,
+512,
+1024,
+2048
+],
+{
+"default": 512
+}
+],
+"remove_floaters": [
+"BOOLEAN",
+{
+"default": true
+}
+],
+"remove_inner_faces": [
+"BOOLEAN",
+{
+"default": false
+}
+]
+}
+},
+"input_order": {
+"required": [
+"mesh",
+"remesh_band",
+"resolution",
+"remove_floaters",
+"remove_inner_faces"
+]
+},
+"output_node": true
+},
+"Trellis2PreProcessImage": {
+"input": {
+"required": {
+"image": [
+"IMAGE"
+],
+"padding": [
+"INT",
+{
+"default": 0,
+"min": 0,
+"max": 1024
+}
+],
+"remove_background": [
+"BOOLEAN",
+{
+"default": false
+}
+],
+"max_size": [
+"INT",
+{
+"default": 2048,
+"min": 512,
+"max": 8192,
+"step": 128
+}
+]
+}
+},
+"input_order": {
+"required": [
+"image",
+"padding",
+"remove_background",
+"max_size"
+]
+},
+"output_node": false
+},
+"Trellis2FillHolesNicelyWithMeshlib": {
+"input": {
+"required": {
+"mesh": [
+"MESHWITHVOXEL"
+]
+}
+},
+"input_order": {
+"required": [
+"mesh"
+]
+},
+"output_node": false
+},
+"Trellis2FillHolesWithCuMesh": {
+"input": {
+"required": {
+"mesh": [
+"MESHWITHVOXEL"
+],
+"max_permieters": [
+"FLOAT",
+{
+"default": 0.03,
+"min": 0.001,
+"max": 99.999,
+"step": 0.001
+}
+]
+}
+},
+"input_order": {
+"required": [
+"mesh",
+"max_permieters"
+]
+},
+"output_node": false
+},
+"Trellis2ImageCondGenerator": {
+"input": {
+"required": {
+"pipeline": [
+"TRELLIS2PIPELINE"
+],
+"image": [
+"IMAGE"
+],
+"max_views": [
+"INT",
+{
+"default": 1,
+"min": 1,
+"max": 999
+}
+]
+}
+},
+"input_order": {
+"required": [
+"pipeline",
+"image",
+"max_views"
+]
+},
+"output_node": true
+},
+"Trellis2SparseGenerator": {
+"input": {
+"required": {
+"pipeline": [
+"TRELLIS2PIPELINE"
+],
+"image_cond": [
+"IMAGE_COND"
+],
+"seed": [
+"INT",
+{
+"default": 0,
+"min": 0,
+"max": 2147483647
+}
+],
+"sparse_structure_steps": [
+"INT",
+{
+"default": 12,
+"min": 1,
+"max": 100
+}
+],
+"sparse_structure_guidance_strength": [
+"FLOAT",
+{
+"default": 6.5,
+"min": 0.0,
+"max": 99.99,
+"step": 0.01
+}
+],
+"sparse_structure_guidance_rescale": [
+"FLOAT",
+{
+"default": 0.05,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"sparse_structure_rescale_t": [
+"FLOAT",
+{
+"default": 4.0,
+"min": 0.0,
+"max": 9.99,
+"step": 0.01
+}
+],
+"sparse_structure_sampler": [
+[
+"euler",
+"heun",
+"rk4",
+"rk5"
+],
+{
+"default": "euler"
+}
+],
+"sparse_structure_resolution": [
+"INT",
+{
+"default": 32,
+"min": 32,
+"max": 128,
+"step": 4
+}
+],
+"sparse_structure_guidance_interval_start": [
+"FLOAT",
+{
+"default": 0.1,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"sparse_structure_guidance_interval_end": [
+"FLOAT",
+{
+"default": 1.0,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"fill_holes": [
+"BOOLEAN",
+{
+"default": true
+}
+],
+"hole_iterations": [
+"INT",
+{
+"default": 1,
+"min": 1,
+"max": 9,
+"step": 1
+}
+],
+"verbose": [
+"BOOLEAN",
+{
+"default": false
+}
+],
+"dino_lock": [
+"FLOAT",
+{
+"default": 0.0,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"dino_substeps": [
+"INT",
+{
+"default": 4,
+"min": 1,
+"max": 99,
+"step": 1
+}
+],
+"hole_fill_algorithm": [
+[
+"morphological_closing",
+"flood_fill",
+"remove_small_holes"
+],
+{
+"default": "flood_fill"
+}
+],
+"dino_foundation_cap": [
+"FLOAT",
+{
+"default": 1.0,
+"min": 0.01,
+"max": 1.0,
+"step": 0.01
+}
+],
+"keep_only_shell": [
+"BOOLEAN",
+{
+"default": true
+}
+]
+},
+"optional": {
+"image": [
+"IMAGE"
+],
+"moge_camera_config": [
+"MOGE_CAM_CONFIG"
+],
+"pixal3d_mv_views": [
+"PIXAL3D_MV_VIEWS"
+]
+}
+},
+"input_order": {
+"required": [
+"pipeline",
+"image_cond",
+"seed",
+"sparse_structure_steps",
+"sparse_structure_guidance_strength",
+"sparse_structure_guidance_rescale",
+"sparse_structure_rescale_t",
+"sparse_structure_sampler",
+"sparse_structure_resolution",
+"sparse_structure_guidance_interval_start",
+"sparse_structure_guidance_interval_end",
+"fill_holes",
+"hole_iterations",
+"verbose",
+"dino_lock",
+"dino_substeps",
+"hole_fill_algorithm",
+"dino_foundation_cap",
+"keep_only_shell"
+],
+"optional": [
+"image",
+"moge_camera_config",
+"pixal3d_mv_views"
+]
+},
+"output_node": true
+},
+"Trellis2ShapeGenerator": {
+"input": {
+"required": {
+"pipeline": [
+"TRELLIS2PIPELINE"
+],
+"image_cond": [
+"IMAGE_COND"
+],
+"coords": [
+"COORDS"
+],
+"resolution": [
+[
+512,
+1024
+],
+{
+"default": 1024
+}
+],
+"shape_steps": [
+"INT",
+{
+"default": 12,
+"min": 1,
+"max": 100
+}
+],
+"shape_guidance_strength": [
+"FLOAT",
+{
+"default": 6.5,
+"min": 0.0,
+"max": 99.99,
+"step": 0.01
+}
+],
+"shape_guidance_rescale": [
+"FLOAT",
+{
+"default": 0.05,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"shape_rescale_t": [
+"FLOAT",
+{
+"default": 4.0,
+"min": 0.0,
+"max": 9.99,
+"step": 0.01
+}
+],
+"shape_sampler": [
+[
+"euler",
+"heun",
+"rk4",
+"rk5"
+],
+{
+"default": "euler"
+}
+],
+"shape_guidance_interval_start": [
+"FLOAT",
+{
+"default": 0.1,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"shape_guidance_interval_end": [
+"FLOAT",
+{
+"default": 1.0,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"verbose": [
+"BOOLEAN",
+{
+"default": false
+}
+],
+"dino_lock": [
+"FLOAT",
+{
+"default": 0.0,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"dino_substeps": [
+"INT",
+{
+"default": 4,
+"min": 1,
+"max": 99,
+"step": 1
+}
+],
+"dino_foundation_cap": [
+"FLOAT",
+{
+"default": 1.0,
+"min": 0.01,
+"max": 1.0,
+"step": 0.01
+}
+]
+},
+"optional": {
+"image": [
+"IMAGE"
+],
+"moge_camera_config": [
+"MOGE_CAM_CONFIG"
+],
+"pixal3d_mv_views": [
+"PIXAL3D_MV_VIEWS"
+]
+}
+},
+"input_order": {
+"required": [
+"pipeline",
+"image_cond",
+"coords",
+"resolution",
+"shape_steps",
+"shape_guidance_strength",
+"shape_guidance_rescale",
+"shape_rescale_t",
+"shape_sampler",
+"shape_guidance_interval_start",
+"shape_guidance_interval_end",
+"verbose",
+"dino_lock",
+"dino_substeps",
+"dino_foundation_cap"
+],
+"optional": [
+"image",
+"moge_camera_config",
+"pixal3d_mv_views"
+]
+},
+"output_node": true
+},
+"Trellis2ShapeCascadeGenerator": {
+"input": {
+"required": {
+"pipeline": [
+"TRELLIS2PIPELINE"
+],
+"image_cond": [
+"IMAGE_COND"
+],
+"shape_slat": [
+"SHAPE_SLAT"
+],
+"from_resolution": [
+"INT"
+],
+"to_resolution": [
+[
+1024,
+1536
+],
+{
+"default": 1024
+}
+],
+"sparse_structure_resolution": [
+"INT",
+{
+"default": 32,
+"min": 32,
+"max": 128,
+"step": 4
+}
+],
+"max_num_tokens": [
+"INT",
+{
+"default": 999999,
+"min": 0,
+"max": 999999
+}
+],
+"shape_steps": [
+"INT",
+{
+"default": 12,
+"min": 1,
+"max": 100
+}
+],
+"shape_guidance_strength": [
+"FLOAT",
+{
+"default": 6.5,
+"min": 0.0,
+"max": 99.99,
+"step": 0.01
+}
+],
+"shape_guidance_rescale": [
+"FLOAT",
+{
+"default": 0.05,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"shape_rescale_t": [
+"FLOAT",
+{
+"default": 4.0,
+"min": 0.0,
+"max": 9.99,
+"step": 0.01
+}
+],
+"shape_sampler": [
+[
+"euler",
+"heun",
+"rk4",
+"rk5"
+],
+{
+"default": "euler"
+}
+],
+"shape_guidance_interval_start": [
+"FLOAT",
+{
+"default": 0.1,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"shape_guidance_interval_end": [
+"FLOAT",
+{
+"default": 1.0,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"verbose": [
+"BOOLEAN",
+{
+"default": false
+}
+],
+"dino_lock": [
+"FLOAT",
+{
+"default": 0.0,
+"min": 0.0,
+"max": 1.0,
+"step": 0.01
+}
+],
+"dino_substeps": [
+"INT",
+{
+"default": 4,
+"min": 1,
+"max": 99,
+"step": 1
+}
+],
+"dino_foundation_cap": [
+"FLOAT",
+{
+"default": 1.0,
+"min": 0.01,
+"max": 1.0,
+"step": 0.01
+}
+]
+},
+"optional": {
+"image": [
+"IMAGE"
+],
+"moge_camera_config": [
+"MOGE_CAM_CONFIG"
+],
+"pixal3d_mv_views": [
+"PIXAL3D_MV_VIEWS"
+]
+}
+},
+"input_order": {
+"required": [
+"pipeline",
+"image_cond",
+"shape_slat",
+"from_resolution",
+"to_resolution",
+"sparse_structure_resolution",
+"max_num_tokens",
+"shape_steps",
+"shape_guidance_strength",
+"shape_guidance_rescale",
+"shape_rescale_t",
+"shape_sampler",
+"shape_guidance_interval_start",
+"shape_guidance_interval_end",
+"verbose",
+"dino_lock",
+"dino_substeps",
+"dino_foundation_cap"
+],
+"optional": [
+"image",
+"moge_camera_config",
+"pixal3d_mv_views"
+]
+},
+"output_node": true
+},
+"Trellis2DecodeLatents": {
+"input": {
+"required": {
+"pipeline": [
+"TRELLIS2PIPELINE"
+],
+"shape_slat": [
+"SHAPE_SLAT"
+],
+"resolution": [
+"INT"
+],
+"use_tiled_decoder": [
+"BOOLEAN",
+{
+"default": true
+}
+]
+},
+"optional": {
+"texture_slat": [
+"TEXTURE_SLAT"
+]
+}
+},
+"input_order": {
+"required": [
+"pipeline",
+"shape_slat",
+"resolution",
+"use_tiled_decoder"
+],
+"optional": [
+"texture_slat"
+]
+},
+"output_node": true
+},
+"Trellis2LoadImageWithTransparency": {
+"input": {
+"required": {
+"image": [
+[
+"Image_1024_00122_.png"
+],
+{
+"image_upload": true
+}
+]
+}
+},
+"input_order": {
+"required": [
+"image"
+]
+}
+},
+"PrimitiveInt": {
+"input": {
+"required": {
+"value": [
+"INT",
+{
+"min": -9223372036854775807,
+"max": 9223372036854775807,
+"control_after_generate": true
+}
+]
+}
+},
+"input_order": {
+"required": [
+"value"
+]
+}
+},
+"PrimitiveString": {
+"input": {
+"required": {
+"value": [
+"STRING",
+{}
+]
+}
+},
+"input_order": {
+"required": [
+"value"
+]
+}
+}
+}

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Form Studio · Log in</title><link rel="icon" href="/favicon.png"><link rel="stylesheet" href="/style.css"></head>
+<body class="login-page">
+<form id="login" class="login-card">
+  <img src="/favicon.png" alt="" width="48" height="48">
+  <h1>Form Studio</h1>
+  <p>Enter the passcode you set on your PC.</p>
+  <input id="passcode" type="password" autocomplete="current-password" required minlength="6" aria-label="Passcode">
+  <button class="button-dark" type="submit">Open</button>
+  <p id="login-error" class="error" role="alert" hidden></p>
+</form>
+<script type="module" src="/login.js"></script>
+</body></html>

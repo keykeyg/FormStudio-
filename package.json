@@ -1,0 +1,1 @@
+{"name":"form-studio-local","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"python3 -B app.py --preview --no-browser"}}
