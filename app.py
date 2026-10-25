@@ -584,6 +584,33 @@ def stated_sizes(texts):
     return found
 
 
+SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(mm|cm|inches|inch|in\b|\")", re.I)
+
+
+def mesh_size(text):
+    """How big a mesh should be, from loose wording: 'make it 118 mm tall', 'Total Height (...): ~4.65 inches',
+    '4.1 in long', or a lone '120 mm'. Returns ("height" | "longest", mm) or None."""
+    heights, lengths, bare = [], [], []
+    for m in SIZE.finditer(text):
+        mm = round(float(m[1]) * UNIT[m[2].lower().strip()], 2)
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        before = text[max(line_start, m.start() - 70):m.start()].lower()
+        after = text[m.end():m.end() + 12].lower()
+        if re.search(r"\b(height|tall|high)\b", before) or re.match(r"\s*(tall|high)\b", after):
+            heights.append(mm)
+        elif re.search(r"\b(length|long)\b", before) or re.match(r"\s*long\b", after):
+            lengths.append(mm)
+        elif not re.search(r"\b(width|wide|depth|deep|thick|diameter|weight|pin|hole|screw|bore)\b", before + " " + after):
+            bare.append(mm)
+    if heights:
+        return ("height", max(heights))  # 'total height' beats a partial height like 'grip height'
+    if lengths:
+        return ("longest", max(lengths))
+    if len(bare) == 1:
+        return ("longest", bare[0])
+    return None
+
+
 def defects(meta, code, user_texts, previous=None):
     """Problems the app can measure itself, phrased for the model."""
     dims = meta["dimensions"]
@@ -828,12 +855,12 @@ def mesh_turn(cfg, request, p, pid, jid):
         p["name"] = content[:45] or "Mesh"
     save_project(p)
     if not p["images"]:
-        raise ValueError("Attach a photo for Mesh mode")
-    sizes = stated_sizes([content])
-    height = next((v for k, v in sizes if k in ("height", "tall")), None)
-    longest = next((v for k, v in sizes if k in ("length", "long")), None)
-    if not (height or longest):
-        raise ValueError("Say how big it should be, e.g. 'make it 150 mm tall' or '200 mm long'.")
+        raise ValueError("Mesh mode needs a photo: attach one clear, angled photo of the part, then send again.")
+    size = mesh_size(content)
+    if not size:
+        raise ValueError("Mesh mode needs the real size to scale the model. Add it to your message, e.g. 'make it 118 mm tall' or '4.65 in tall' (or '200 mm long').")
+    height = size[1] if size[0] == "height" else None
+    longest = size[1] if size[0] == "longest" else None
     workflow = Path(cfg.get("mesh_workflow") or ROOT / "workflows" / "trellis2_mesh.json")
     if not workflow.is_file():
         workflow = ROOT / "workflows" / "trellis2_mesh.json"

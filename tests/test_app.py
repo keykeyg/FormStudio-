@@ -417,7 +417,7 @@ class Integration(unittest.TestCase):
             im=app.DATA/'m.png';png(im,bytes([200,200,200]*4),2)
             image='data:image/png;base64,'+base64.b64encode(im.read_bytes()).decode()
             no_size=self.wait(p['id'],{'kind':'mesh','message':'Make this mask','images':[{'data':image,'name':'mask.png'}]})
-            self.assertEqual(no_size['status'],'error'); self.assertIn('how big',no_size['error'])
+            self.assertEqual(no_size['status'],'error'); self.assertIn('real size',no_size['error'])
             result=self.wait(p['id'],{'kind':'mesh','message':'Make it 150 mm tall'})
             self.assertEqual(result['status'],'done',result)
             v=result['project']['versions'][-1]
@@ -582,6 +582,15 @@ class Integration(unittest.TestCase):
         self.assertIn('CLEARANCE = 0.3',msgs[0]['content']); self.assertIn('PARTS',msgs[0]['content'])
         self.assertEqual(app.defects({'dimensions':[10,10,10],'solids':2,'solid_boxes':[]},'PARTS = 2\n',[]),[])
         self.assertTrue(app.defects({'dimensions':[10,10,10],'solids':2,'solid_boxes':[]},'',[]))
+
+    def test_mesh_size_from_loose_wording(self):
+        spec='Factory HK MP5K Vertical Foregrip\n• Overall Length (Handguard Section): ~4.1 inches\n• Grip Height (Protrusion below handguard): ~3.25 inches\n• Total Height (Top of handguard to bottom of grip): ~4.65 inches\n• Width: ~1.25 inches\n• Pin: 6mm outer diameter'
+        self.assertEqual(app.mesh_size(spec),('height',118.11))
+        self.assertEqual(app.mesh_size('make it 150 mm tall'),('height',150.0))
+        self.assertEqual(app.mesh_size('200mm long please'),('longest',200.0))
+        self.assertEqual(app.mesh_size('scale to 120 mm'),('longest',120.0))
+        self.assertIsNone(app.mesh_size('make cad'))
+        self.assertIsNone(app.mesh_size('a 6 mm pin hole and 25 mm wide'))
 
     def test_size_hints(self):
         self.assertEqual(app.size_hints({'LENGTH':100.0,'WIDTH':30.0,'HEIGHT':45.0,'HOLE_D':5.0},[100,15,45]),
