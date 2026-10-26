@@ -396,7 +396,11 @@ class Integration(unittest.TestCase):
                 if self.path=='/system_stats': return self.send({'system':{}})
                 if self.path.startswith('/object_info/'):
                     kind=urllib.parse.unquote(self.path.split('/')[-1]); return self.send({kind:INFO[kind]} if kind in INFO else {})
-                if self.path.startswith('/history/'): return self.send({'p1':{'status':{'status_str':'success'},'outputs':{'9':{'result':[{'filename':'trellis_00001_.glb','subfolder':'','type':'output'}]}}}})
+                if self.path.startswith('/history/'):
+                    seen['history']=seen.get('history',0)+1
+                    if seen['history']<=2:  # ComfyUI busy with a heavy step: errors at first, then the result
+                        self.send_response(503); self.send_header('Content-Length','0'); self.end_headers(); return
+                    return self.send({'p1':{'status':{'status_str':'success'},'outputs':{'9':{'result':[{'filename':'trellis_00001_.glb','subfolder':'','type':'output'}]}}}})
                 self.send({})
             def do_POST(self):
                 body=self.rfile.read(int(self.headers['Content-Length']))

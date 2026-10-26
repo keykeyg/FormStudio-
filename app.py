@@ -882,7 +882,8 @@ def mesh_turn(cfg, request, p, pid, jid):
         try:
             src = mesh_mode.generate(base, workflow, image, cfg.get("comfy_root") or mesh_mode.default_comfy_root(),
                                      progress=lambda sec: update_job(jid, phase=f"TRELLIS.2 is building the mesh ({sec}s) · {mesh_mode.last_log_line(DATA / 'comfyui.log')}"),
-                                     cancelled=lambda: cancelled(jid), attention=attention)
+                                     cancelled=lambda: cancelled(jid), attention=attention,
+                                     running=lambda: proc is None or proc.poll() is None)
         except InterruptedError as exc:
             raise Cancelled() from exc
     finally:

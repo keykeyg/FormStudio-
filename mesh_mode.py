@@ -333,7 +333,7 @@ def load_workflow(base, workflow_path: Path):
     return ui_to_api(workflow, node_info, targets, settings.get("overrides"))
 
 
-def generate(base, workflow_path: Path, image: Path, comfy_root, progress, cancelled, timeout_s=2700, attention=None):
+def generate(base, workflow_path: Path, image: Path, comfy_root, progress, cancelled, timeout_s=2700, attention=None, running=lambda: True):
     """Queue the workflow on the photo and return the generated mesh file's path."""
     workflow, _notes = load_workflow(base, workflow_path)
     if attention is not None and not attention.get("flash_attn"):
@@ -349,7 +349,7 @@ def generate(base, workflow_path: Path, image: Path, comfy_root, progress, cance
                 hits += 1
     if not hits:
         raise ValueError(f"The mesh workflow has no {PLACEHOLDER} input")
-    started = time.time()
+    started, quiet_since = time.time(), None
     resp = post_json(base + "/prompt", {"prompt": workflow, "client_id": uuid.uuid4().hex})
     if not resp.get("prompt_id") or resp.get("error") or resp.get("node_errors"):
         raise ValueError(f"ComfyUI rejected the workflow: {json.dumps(resp)[:1500]}")
@@ -361,7 +361,19 @@ def generate(base, workflow_path: Path, image: Path, comfy_root, progress, cance
             except (OSError, ValueError):
                 pass
             raise InterruptedError()
-        hist = get_json(base + "/history/" + pid, timeout=30)
+        try:
+            hist = get_json(base + "/history/" + pid, timeout=60)
+            quiet_since = None
+        except (OSError, ValueError):
+            # ComfyUI stops answering while TRELLIS.2 runs heavy steps; that's not a failure unless it lasts or the process died.
+            if not running():
+                raise ValueError("ComfyUI stopped while building the mesh (see data/comfyui.log)")
+            quiet_since = quiet_since or time.time()
+            if time.time() - quiet_since > 900:
+                raise ValueError("ComfyUI stopped responding for 15 minutes while building the mesh")
+            progress(int(time.time() - started))
+            time.sleep(5)
+            continue
         if pid in hist:
             entry = hist[pid]
             status = entry.get("status", {})
