@@ -39,4 +39,10 @@
 .mesh-size-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}.mesh-size-head b{font-size:11px;font-weight:600}.mesh-size-head small{font-size:9px;color:#7b8984}
 .mesh-size-fields{display:flex;gap:10px;align-items:flex-end;margin:8px 0}.mesh-size-fields label{font-size:9px;color:#657771;display:flex;flex-direction:column;gap:4px}
 .mesh-size-fields input{width:96px;border:1px solid #d3dcd4;border-radius:4px;background:#fff;padding:6px;font-size:12px;color:#273d3d}.mesh-size-fields span{font-size:10px;color:#7b8984;padding-bottom:7px}
+.mesh-polish{border-top:1px solid #e3e8e2;margin-top:10px;padding-top:9px}.mesh-polish .mesh-size-actions{margin-top:8px}.mesh-polish select{margin-left:6px;border:1px solid #d3dcd4;border-radius:4px;background:#fff;padding:4px;font-size:11px;color:#273d3d}
 .mesh-size-actions{display:flex;justify-content:space-between;align-items:center;gap:10px}.mesh-size-actions .check{font-size:10px;color:#3b5157}
+.working{flex-wrap:wrap;max-width:min(560px,92%)}.working-text{flex:1;min-width:0}
+.meter{height:6px;border-radius:3px;background:#ffffff33;margin-top:8px;overflow:hidden}.meter span{display:block;height:100%;width:0;background:#e6f4f2;border-radius:3px;transition:width .8s linear}
+.meter span.busy{width:100%;background:repeating-linear-gradient(-45deg,#e6f4f2 0 8px,#9fc7c3 8px 16px);background-size:200% 100%;animation:stripes 1.4s linear infinite}
+@keyframes stripes{to{background-position:-46px 0}}#meter-text{display:block;font-size:9px;line-height:1.5;color:#dcebea;margin-top:6px}
+@media(prefers-reduced-motion:reduce){.meter span.busy{animation:none}}

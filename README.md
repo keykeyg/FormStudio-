@@ -50,10 +50,12 @@ No cloud, no accounts, no telemetry. Photos, models and history stay in a folder
 | **Slice → Bambu** | Slices with Bambu Studio's command line and its own X2D presets, then opens the sliced plate in Bambu Studio so you can press Print. You get the exact time and grams. |
 | **Mesh mode** | Photo → TRELLIS.2 (ComfyUI) → repaired, real-size mesh. |
 | **CAD edits on meshes** | Ask for holes, slots, flat bases or tabs on a sculpted mesh. The model writes CAD cut/add solids and Form Studio applies them as exact mesh booleans. |
+| **Polish** | Smooths stair-steps and bumps out of a mesh without changing its size. For TRELLIS.2 meshes it rebuilds from TRELLIS.2's own surface, so detail is kept. |
 | **Mesh size fields** | Sculpted and imported models get X / Y / Z size boxes with **Keep proportions**. Type 216 mm and it scales right away, with no AI involved. |
 | **Planner** | On meshes, your chat is routed to the right tool: resize, stretch one section, move a part, cut/add material, ask a question, or just answer. "The 912 mm needs to be 216" or "make it 180 mm long" are handled instantly by rules; anything else goes through a short text-only call to the local model. |
 | **Import + combine** | Bring in STL / 3MF / OBJ / PLY / GLB files, e.g. from MakerWorld. Start a new design with one, or add it to the current design as a separate part, then say where it goes ("put the spool holder on top, centered") and add slots or holes. |
-| **Team review** | Like the overnight runner: your selected model designs it, your other model reviews it against your photos and sizes and fixes it. Both versions are kept, and the measurably better one stays current. |
+| **Team review** | Like the overnight runner: your selected model designs it, then a reviewer checks it against your sizes and the measured problems and fixes it. By default the reviewer is the same model with fresh eyes (no slow model swap). Both versions are kept, and the measurably better one stays current. |
+| **Progress meter** | While a model works you see what it's doing ("27B is reading your request: 56% · about 40 s left", then "writing: 310 tokens at 21 tokens/s"). Estimates come from that model's past speed on your PC. |
 | **Compare** | Runs the same request on each of your models, one after the other, and keeps every result as a version. |
 | **Variations** | Several independent attempts, split across your models at different temperatures. Each one is self-checked, the best becomes current, and the run can be scheduled for overnight. |
 | **Phone access** | Optional, passcode-protected access from your phone on the home network or Tailscale, with a one-tap **Camera** button. |
@@ -204,7 +206,15 @@ Before the first run, Form Studio checks ComfyUI's Python and adds what TRELLIS.
 
 ComfyUI runs unbuffered, and the job status shows its latest progress line (e.g. `Sampling shape SLat: 42%`).
 
-TRELLIS meshes usually have stacked or leaky triangles. If the mesh isn't watertight after hole filling, Form Studio rebuilds it as a closed solid: it voxelizes at about 1/400 of the longest side, fills the inside, and runs VTK flying edges, smoothing and decimation to 200k triangles. Fine detail softens slightly, but the result always prints and can take CAD cuts. In testing, a single photo of an angled foregrip became a 100 × 29 × 53 mm watertight mesh in about 5 minutes on an RTX 3090.
+TRELLIS meshes usually have stacked or leaky triangles. If the mesh isn't watertight after hole filling, Form Studio rebuilds it as a closed solid:
+1. voxelizes it finely (up to 1000 voxels along the longest side, at most about 60 million in total) and fills the inside
+2. contours it with VTK flying edges and smooths it lightly
+3. **snaps every new vertex back onto TRELLIS.2's own surface** (the tangent plane of the nearest point, when it's close and faces the same way)
+4. decimates to 200k triangles
+
+Only real gaps keep the rebuilt surface, so the result keeps TRELLIS.2's detail with no voxel stair-steps. It always prints and can take CAD cuts.
+
+Before October 28, 2026 the rebuild used a coarse 1/400 grid and no snapping. Thin, long parts came out terraced (the B&T stock was only about 44 voxels thick). Those versions can be fixed with **✨ Polish**. In testing, a single photo of an angled foregrip became a 100 × 29 × 53 mm watertight mesh in about 5 minutes on an RTX 3090.
 
 **No manual workflow export is needed.** `workflows/trellis2_mesh.json` is ComfyUI-Trellis2's *MeshOnly* editor workflow. On each run Form Studio asks the running ComfyUI for its node definitions (`/object_info`) and converts the editor file to API format. It handles seed "control" values, linked widgets, reroutes and newer inputs, and queues only the nodes that feed the export. Overrides in the file's `extra.formstudio` block set the image input, background removal, face count (200k) and file name.
 
@@ -226,6 +236,14 @@ A mesh (from Mesh mode or an import) has no source code, so typing "the dimensio
 | "add two 5 mm holes 40 mm apart through the top" | precise CAD cut on the mesh |
 | "how long is it?" | answers without changing anything |
 
+### Polish (smooth a mesh)
+
+Under **Dimensions → Surface**, pick a strength and click **✨ Polish**, or just say "it's too steppy, smooth it". The size stays exactly the same and the old version stays in the history.
+- **TRELLIS.2 meshes**, including resized or already-polished ones: Form Studio finds TRELLIS.2's original output (`raw.glb` in the version folder) and rebuilds the surface from it with the fine, snapped rebuild above. **Faithful** gives TRELLIS.2's own surface. **Smoother** and **Smoothest** add gentle smoothing on top.
+- **Other meshes** (imports, CAD-edited or stretched meshes): windowed-sinc smoothing, which doesn't shrink the part. **Smoothest** also rounds small edges and fine detail.
+
+On the B&T stock from an older run, the rebuild from TRELLIS.2's original sat 0.30 mm (mean) from TRELLIS.2's surface, against 1.38 mm for the old repair.
+
 The planner only asks a question when it truly can't act. Turn it off in Settings if you want every message to go straight to CAD edits.
 
 ### Import STL / 3MF and combine
@@ -239,10 +257,21 @@ The planner only asks a question when it truly can't act. Turn it off in Setting
 
 Turn on **⚖ Team** and send a request. Form Studio then:
 1. builds it with your selected model, with the usual self-check
-2. loads your other model from the builder's config
-3. has that model review the result against your photos, your sizes and the measured problems, and fix it if needed
+2. picks the reviewer from **Settings → Team reviewer**:
+   - **Same model, fresh eyes** (the default): a new conversation with no swap
+   - **The other model**: loads it from the builder's config. Flash-Next is offloaded and writes at about 4 tokens/s.
+   - a specific model
+3. has the reviewer check the code against your request, your sizes and the measured problems, and fix it if needed. The review is text-only, so it's quick even on an offloaded model.
 
-Both versions are kept. The reviewer's version becomes current unless it measures worse. The reviewer stays loaded afterwards. Team review applies to CAD designs; meshes go through the planner.
+Both versions are kept. The reviewer's version becomes current unless it measures worse. Team review applies to CAD designs; meshes go through the planner.
+
+### Progress meter
+
+While a local model works, the status box shows the stage and the numbers:
+- **Reading** (prompt processing): a bar with a percent and the time left, estimated from that model's past reading speed on your PC. The first run with a model just counts up.
+- **Writing**: tokens so far, tokens per second, and a note when it's slower than that model usually is. A thinking model can write for a while before any visible text appears, and the meter says so.
+
+Speeds are kept per model in `data/speed.json` (a moving average).
 
 ### Compare and Variations (including overnight)
 
@@ -304,6 +333,8 @@ The suite runs with a mock LM Studio server, a mock ComfyUI and a fake `bambu-st
 - printable/split/dowels, the print ZIP, Compare
 - the phone passcode and rate limit
 - Mesh mode, editor-workflow conversion, mesh CAD edits and their parameter rebuilds
+- the snapped hole repair, Polish (with and without TRELLIS.2's original), resize/stretch/import/combine, the planner and team review
+- the progress meter (reading estimate, then remembered speed)
 - all templates, reference-card detection on a synthetic tilted photo
 - Variations ranking, scheduling and cancel
 - Bambu preset flattening and slicing, fit rules, project delete

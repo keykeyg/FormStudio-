@@ -31,43 +31,12 @@ def repair(mesh, min_frac=0.005):
 
 
 def voxel_remesh(mesh, target_faces=200_000):
-    """Rebuild a closed, printable surface from a leaky mesh: voxelize, fill the inside, then VTK flying edges.
-    Small gaps (under one voxel) close; detail finer than the voxel size (about 1/400 of the longest side) is smoothed."""
-    import vtk
-    from vtk.util import numpy_support
-    pitch = max(0.15, float(max(mesh.extents)) / 400)
-    grid = mesh.voxelized(pitch).fill()
-    dense = np.pad(grid.matrix.astype(np.uint8), 2)
-    image = vtk.vtkImageData()
-    image.SetDimensions(*dense.shape)
-    image.SetSpacing(pitch, pitch, pitch)
-    image.GetPointData().SetScalars(numpy_support.numpy_to_vtk(dense.ravel(order="F"), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR))
-    surface = vtk.vtkFlyingEdges3D()
-    surface.SetInputData(image)
-    surface.SetValue(0, 0.5)
-    smooth = vtk.vtkWindowedSincPolyDataFilter()
-    smooth.SetInputConnection(surface.GetOutputPort())
-    smooth.SetNumberOfIterations(12)
-    smooth.SetPassBand(0.1)
-    smooth.NonManifoldSmoothingOn()
-    smooth.NormalizeCoordinatesOn()
-    stage = smooth
-    smooth.Update()
-    count = smooth.GetOutput().GetNumberOfCells()
-    if count > target_faces:
-        decimate = vtk.vtkQuadricDecimation()
-        decimate.SetInputConnection(smooth.GetOutputPort())
-        decimate.SetTargetReduction(1 - target_faces / count)
-        decimate.VolumePreservationOn()
-        stage = decimate
-    stage.Update()
-    poly = stage.GetOutput()
-    verts = numpy_support.vtk_to_numpy(poly.GetPoints().GetData()).astype(float)
-    faces = numpy_support.vtk_to_numpy(poly.GetPolys().GetConnectivityArray()).reshape(-1, 3)
-    # Back into the mesh's coordinates: voxel (i, j, k) sits at transform @ (i, j, k); the pad shifted it by 2.
-    origin = np.asarray(grid.transform)[:3, 3] - 2 * pitch
-    fixed = trimesh.Trimesh(verts + origin, faces, process=True)
-    trimesh.repair.fix_normals(fixed)
+    """Rebuild a closed, printable surface from a leaky mesh: voxelize finely (up to 1000 voxels along the longest side),
+    fill the inside, contour, then snap the new surface onto the original one so it keeps TRELLIS.2's own detail
+    instead of voxel stair-steps. Only real gaps keep the rebuilt surface."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    from mesh_ops import rebuild, REBUILD_VOXELS
+    fixed, _ = rebuild(mesh, voxels=REBUILD_VOXELS, sigma=0.6, passes=20, target_faces=target_faces, snap_to=mesh)
     return fixed
 
 

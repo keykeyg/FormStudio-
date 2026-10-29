@@ -607,6 +607,53 @@ class Integration(unittest.TestCase):
         app.commit_version(pr,folder,'',meta,'Mesh from TRELLIS.2','TRELLIS.2',None)
         return p['id']
 
+    def test_hole_repair_keeps_the_original_surface(self):
+        import subprocess, sys, trimesh, numpy as np
+        ball=trimesh.creation.icosphere(5,1.0)
+        keep=np.ones(len(ball.faces),bool); keep[:40]=False; ball.update_faces(keep); ball.remove_unreferenced_vertices()  # a leak
+        tmp=Path(tempfile.mkdtemp()); ball.export(tmp/'raw.stl')
+        env={**os.environ,'FORM_STUDIO_REBUILD_VOXELS':'200'}
+        r=subprocess.run([sys.executable,'-I','-B',str(Path(app.__file__).parent/'mesh_worker.py'),str(tmp/'raw.stl'),str(tmp/'out'),'--longest','50'],capture_output=True,text=True,env=env,timeout=240)
+        self.assertEqual(r.returncode,0,r.stderr[-800:])
+        meta=json.loads((tmp/'out'/'metadata.json').read_text()); self.assertTrue(meta['remeshed']); self.assertTrue(meta['valid'])
+        m=trimesh.load(tmp/'out'/'model.stl'); radius=np.linalg.norm(m.vertices-m.bounds.mean(axis=0),axis=1)
+        self.assertLess(float(np.std(radius)),0.01)  # snapped onto the sphere (~0.001); a 200-voxel rebuild alone is ~0.03
+        shutil.rmtree(tmp,ignore_errors=True)
+
+    def test_polish_smooths_and_uses_trellis_original(self):
+        import trimesh, numpy as np, mesh_ops
+        os.environ['FORM_STUDIO_REBUILD_VOXELS']='150'
+        try:
+            pid=self.mesh_project((40,40,40))
+            pr=app.read_project(pid); folder=app.project_path(pid)/pr['versions'][-1]['id']
+            ball=trimesh.creation.icosphere(5,20.0)
+            steppy,_=mesh_ops.rebuild(ball,voxels=100,sigma=0,passes=1)  # what the old hole repair made: voxel stair-steps
+            steppy.apply_translation([0,0,20]); steppy.export(folder/'model.stl')
+            raw=ball.copy(); raw.apply_transform(trimesh.transformations.rotation_matrix(-np.pi/2,[1,0,0])); raw.export(folder/'raw.glb')  # glTF is Y-up
+            def bumps(vid):
+                m=trimesh.load(app.project_path(pid)/vid/'model.stl'); r=np.linalg.norm(m.vertices-m.bounds.mean(axis=0),axis=1)
+                return float(np.std(r))
+            r=self.wait(pid,{'kind':'polish','strength':'medium'})
+            self.assertEqual(r['status'],'done',r.get('error'))
+            v=r['project']['versions'][-1]; self.assertTrue(v['polished']['source']); self.assertTrue(v['valid'])
+            self.assertIn("TRELLIS.2's original",v['message'])
+            for a,b in zip(v['dimensions'],steppy.extents): self.assertAlmostEqual(a,b,places=1)
+            self.assertLess(bumps(v['id']),bumps(r['project']['versions'][0]['id'])/2)
+            # A resize keeps the link to the original; chat routes "smooth it" to polish with no model call.
+            r=self.wait(pid,{'kind':'resize','size':[None,None,30],'lock':True}); self.assertEqual(r['status'],'done',r.get('error'))
+            before=len(MockLM.requests)
+            r=self.wait(pid,{'message':"it's still a bit steppy, smooth it",'model':'test-vision'})
+            self.assertEqual(r['status'],'done',r.get('error')); self.assertEqual(len(MockLM.requests),before)
+            v=r['project']['versions'][-1]; self.assertEqual(v['polished'],{**v['polished'],'strength':'light','source':True})
+            self.assertAlmostEqual(v['dimensions'][2],30,places=1)
+            # No TRELLIS.2 original (an imported or CAD-edited mesh): plain smoothing, same size.
+            pid2=self.mesh_project((60,40,20))
+            r=self.wait(pid2,{'kind':'polish','strength':'strong'})
+            self.assertEqual(r['status'],'done',r.get('error')); v=r['project']['versions'][-1]
+            self.assertFalse(v['polished']['source']); self.assertEqual([round(x,1) for x in v['dimensions']],[60,40,20])
+        finally:
+            os.environ.pop('FORM_STUDIO_REBUILD_VOXELS',None)
+
     def test_mesh_size_fields_and_planner_rules(self):
         pid=self.mesh_project((494,926,104))
         r=self.wait(pid,{'kind':'resize','size':[None,216,None],'lock':True})
@@ -668,6 +715,8 @@ class Integration(unittest.TestCase):
         def load(cfg,name,jid):
             state['loaded']=['reviewer-model']; return 'reviewer-model'
         app.load_model=load
+        saved_cfg=json.loads((app.DATA/'settings.json').read_text()) if (app.DATA/'settings.json').is_file() else {}
+        app.atomic(app.DATA/'settings.json',{**saved_cfg,'team_reviewer':'other'})  # the default is 'same'; test the swap first
         try:
             p=self.request('/api/projects',{})
             MockLM.replies=['Cube.\n```python\nimport cadquery as cq\nLENGTH = 10.0\nresult = cq.Workplane().box(LENGTH, 10, 10)\n```',
@@ -680,7 +729,6 @@ class Integration(unittest.TestCase):
             self.assertNotIn('image_url',json.dumps(MockLM.requests[-1]))  # the review is text-only (fast on an offloaded model)
             self.assertIn('Team:',pr['messages'][-1]['text'])
             # Fresh eyes: same model, new context, no swap.
-            saved_cfg=json.loads((app.DATA/'settings.json').read_text())
             app.atomic(app.DATA/'settings.json',{**saved_cfg,'team_reviewer':'same'})
             state['loaded']=['test-vision']; app.load_model=lambda *a: self.fail('no model swap expected')
             try:
@@ -692,6 +740,40 @@ class Integration(unittest.TestCase):
                 app.atomic(app.DATA/'settings.json',saved_cfg)
         finally:
             app.loadable_models,app.load_model,app.loaded_models=saved
+            app.atomic(app.DATA/'settings.json',saved_cfg)
+
+    def test_progress_meter_reports_reading_then_remembers_speed(self):
+        p=self.request('/api/projects',{})
+        MockLM.delay=1.5
+        MockLM.replies=['Cube.\n```python\nimport cadquery as cq\nresult = cq.Workplane().box(10, 10, 10)\n```']
+        try:
+            jid=self.request('/api/projects/'+p['id']+'/jobs',{'message':'a 10 mm cube','model':'test-vision'})['job']
+            seen=None
+            for _ in range(40):
+                j=self.request('/api/jobs/'+jid)
+                if j.get('llm') and not j['llm'].get('first_token'):
+                    seen=j['llm']; break
+                time.sleep(.05)
+            self.assertIsNotNone(seen); self.assertGreater(seen['prompt_tokens'],100); self.assertIsNone(seen['first_token'])
+            while self.request('/api/jobs/'+jid)['status']=='running':
+                time.sleep(.1)
+            done=self.request('/api/jobs/'+jid)
+            self.assertTrue(done['llm']['done']); self.assertIsNotNone(done['llm']['first_token'])
+            speed=json.loads((app.DATA/'speed.json').read_text())['test-vision']
+            self.assertGreater(speed['prefill'],0)
+            # The next call gets an estimate from that history.
+            MockLM.replies=['Bigger.\n```python\nimport cadquery as cq\nresult = cq.Workplane().box(20, 10, 10)\n```']
+            jid=self.request('/api/projects/'+p['id']+'/jobs',{'message':'make it 20 mm long','model':'test-vision'})['job']
+            for _ in range(40):
+                j=self.request('/api/jobs/'+jid)
+                if j.get('llm'):
+                    break
+                time.sleep(.05)
+            self.assertGreater(j['llm']['expected_read'],0)
+            while self.request('/api/jobs/'+jid)['status']=='running':
+                time.sleep(.1)
+        finally:
+            MockLM.delay=0.0
 
     def test_size_hints(self):
         self.assertEqual(app.size_hints({'LENGTH':100.0,'WIDTH':30.0,'HEIGHT':45.0,'HOLE_D':5.0},[100,15,45]),

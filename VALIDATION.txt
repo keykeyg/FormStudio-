@@ -77,3 +77,9 @@ On the PC (RTX 3090, Qwen3.8 27B):
 - Team review: Flash-Next as reviewer runs at ~4 tok/s (offloaded), so the review is text-only (code + sizes + measured facts) and a "Same model, fresh eyes" reviewer option was added for speed.
 - Slicing now passes the build plate (default Textured PEI); the CLI otherwise assumed the Cool Plate and refused PETG/ABS.
 In the container: 33 integration tests pass (mock LM Studio, mock ComfyUI, fake bambu-studio).
+
+1.6 (Oct 28, 2026): progress meter, fresh-eyes team review by default, finer hole repair, Polish.
+- Progress meter checked in a browser against a mock LM Studio: first run "reading your request (~1.2k tokens) · 2 s, first run with this model, so there is no estimate yet"; then "writing: 20 tokens"; second run "reading (~2.1k tokens): 56% · about 1 s left" (speed remembered).
+- Stair-steps traced to Form Studio's own hole repair, not TRELLIS.2. On a B&T stock (a real TRELLIS.2 1024-cascade output, 197k triangles, 9,890 loose pieces, not watertight), the old 1/400 voxel rebuild sat 1.38 mm (mean) from TRELLIS.2's surface, with 65% of its area facing straight along an axis (the raw mesh: 51%). The new fine rebuild with snapping: 0.30 mm, 51%. Renders showed the terraces gone and the grooves and ribs kept. 216 mm long: ~40 s and 4.8 GB RAM in the container.
+- Polish on that old stepped version: rebuilt from raw.glb (Faithful) ~55 s; smoothing-only (no original) ~11 s, which loses the grooves at Smoother/Smoothest on such coarse steps, so the original is always used when the version chain allows it.
+In the container: 36 integration tests pass (mock LM Studio, mock ComfyUI, fake bambu-studio).

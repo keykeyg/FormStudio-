@@ -121,7 +121,7 @@ def defaults():
             "bed": [256, 256, 260], "timeout": 900, "max_tokens": 8192, "disable_thinking": True,
             "max_attempts": 4, "self_review_rounds": 3, "bambu_path": "",
             "comfy_root": mesh_mode.default_comfy_root(), "comfy_url": "http://127.0.0.1:8188", "mesh_workflow": str(ROOT / "workflows" / "trellis2_mesh.json"),
-            "fit_clearance": 0.2, "material": "PLA", "walls": 2, "infill": 15, "plate": "Textured PEI Plate", "planner": True, "team_reviewer": "other"}
+            "fit_clearance": 0.2, "material": "PLA", "walls": 2, "infill": 15, "plate": "Textured PEI Plate", "planner": True, "team_reviewer": "same"}
 
 
 def config():
@@ -436,6 +436,40 @@ def cancelled(jid):
         return bool(JOBS.get(jid, {}).get("cancel"))
 
 
+# ---- Speed memory for the progress meter: how fast each model reads prompts and writes, from past runs ----
+SPEED_LOCK = threading.Lock()
+
+
+def prompt_tokens(messages):
+    """Rough prompt size: ~3.6 characters per token, images by their encoded size (renders ~300, photos up to ~2500)."""
+    chars, tokens = 0, 0
+    for msg in messages:
+        content = msg.get("content")
+        for part in content if isinstance(content, list) else [{"type": "text", "text": content or ""}]:
+            if part.get("type") == "image_url":
+                tokens += min(2600, max(250, len(part["image_url"]["url"]) // 75))
+            else:
+                chars += len(part.get("text") or "")
+    return int(tokens + chars / 3.6)
+
+
+def speeds():
+    try:
+        return json.loads((DATA / "speed.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_speed(model, prefill_rate=None, write_rate=None):
+    with SPEED_LOCK:
+        data = speeds()
+        entry = data.setdefault(model, {})
+        for key, value in (("prefill", prefill_rate), ("write", write_rate)):
+            if value and value > 0:
+                entry[key] = round(value if key not in entry else 0.6 * entry[key] + 0.4 * value, 2)
+        atomic(DATA / "speed.json", data)
+
+
 def infer(cfg, model, messages, jid):
     require_idle(cfg)
     loaded = {m["id"]: m for m in loaded_models(cfg)}
@@ -455,6 +489,13 @@ def infer(cfg, model, messages, jid):
     with LOCK:
         CONNS[jid] = conn
     pieces, reasoning = [], 0
+    known = speeds().get(model, {})
+    tokens_in = prompt_tokens(messages)
+    started, first = time.time(), None
+    # The browser draws the meter from this: reading (prompt processing, no output yet) -> writing.
+    update_job(jid, llm={"model": model, "started": started, "prompt_tokens": tokens_in,
+                         "expected_read": round(tokens_in / known["prefill"], 1) if known.get("prefill") else None,
+                         "first_token": None, "tokens": 0, "rate": None, "typical_rate": known.get("write")})
     try:
         if cancelled(jid):
             raise Cancelled()
@@ -487,8 +528,21 @@ def infer(cfg, model, messages, jid):
                 think = delta.get("reasoning_content") or delta.get("reasoning")
                 if isinstance(think, str):
                     reasoning += len(think)
-            update_job(jid, characters=sum(map(len, pieces)) + reasoning)
-        return "".join(pieces)
+            written = sum(map(len, pieces)) + reasoning
+            if written and first is None:
+                first = time.time()
+            meter = None
+            if first is not None:
+                with LOCK:
+                    meter = dict(JOBS.get(jid, {}).get("llm") or {})
+                elapsed = max(0.5, time.time() - first)
+                meter.update(first_token=first, tokens=int(written / 3.6), rate=round(written / 3.6 / elapsed, 1) if elapsed > 2 else None)
+            update_job(jid, characters=written, **({"llm": meter} if meter else {}))
+        text = "".join(pieces)
+        if first is not None:
+            done = time.time()
+            remember_speed(model, tokens_in / max(0.5, first - started), (len(text) + reasoning) / 3.6 / (done - first) if done - first > 3 else None)
+        return text
     except (OSError, http.client.HTTPException) as exc:
         if cancelled(jid):
             raise Cancelled() from exc
@@ -496,6 +550,8 @@ def infer(cfg, model, messages, jid):
     finally:
         with LOCK:
             CONNS.pop(jid, None)
+            if isinstance(JOBS.get(jid, {}).get("llm"), dict):
+                JOBS[jid]["llm"]["done"] = True
         conn.close()
 
 
@@ -1194,6 +1250,38 @@ def stretch_turn(cfg, plan, p, pid, jid, parent, label="Stretch"):
                    f"(only {axis.upper()} {band[0]}..{band[1]} mm was stretched; the rest moved unchanged). Now {size_text(meta['dimensions'])}.", label, parent)
 
 
+def raw_source(pid, p, v):
+    """TRELLIS.2's original output behind a mesh version: its own raw file, or its source's when the version is only a
+    resize or polish of it (those keep the shape, so the original still lines up)."""
+    for _ in range(50):
+        if not v:
+            return None
+        raw = next(iter(sorted((project_path(pid) / v["id"]).glob("raw.*"))), None)
+        if raw:
+            return raw
+        if not (v.get("scaled") or v.get("polished")):
+            return None
+        v = version_of(p, v.get("parent"))
+    return None
+
+
+def polish_turn(cfg, plan, p, pid, jid, parent, label="Polish"):
+    pv = require_mesh(p, parent)
+    strength = str(plan.get("strength") or "medium").lower()
+    strength = strength if strength in ("light", "medium", "strong") else "medium"
+    raw = raw_source(pid, p, pv)
+    update_job(jid, phase="Rebuilding the surface from TRELLIS.2's original" if raw else "Smoothing the surface")
+    folder = new_folder(pid)
+    meta = mesh_op(cfg, "polish", project_path(pid) / parent / "model.stl", folder, strength, *([raw] if raw else []), timeout=1200)
+    info = meta.get("polished", {})
+    if info.get("source"):
+        how = "rebuilt from TRELLIS.2's original surface, so the stair-steps from the hole repair are gone" + (", then smoothed" if info.get("smoothed") else "")
+    else:
+        how = "smoothed the surface (stair-steps and bumps); sharp edges are a little softer"
+    text = f"Polished ({strength}): {how}. Size kept at {size_text(meta['dimensions'])}. The previous version is still in the history."
+    commit_version(p, folder, "", meta, text, label, parent)
+
+
 def copy_parts(src, dst):
     dst.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src / "parts", dst / "parts", dirs_exist_ok=True)
@@ -1302,6 +1390,8 @@ def planner_turn(cfg, model, content, p, pid, jid, parent, label=""):
         stretch_turn(cfg, plan, p, pid, jid, parent, label or "Planner · stretch")
     elif tool == "place":
         place_turn(cfg, plan, p, pid, jid, parent, label or "Planner · place")
+    elif tool == "polish":
+        polish_turn(cfg, plan, p, pid, jid, parent, label or "Planner · polish")
     elif tool == "cad":
         return "cad", plan["request"]
     else:
@@ -1436,6 +1526,8 @@ def job_run(jid, pid, request, cfg):
             resize_turn(cfg, plan, p, pid, jid, parent)
         elif request.get("kind") == "import":
             import_turn(cfg, request, p, pid, jid, parent)
+        elif request.get("kind") == "polish":
+            polish_turn(cfg, {"tool": "polish", "strength": request.get("strength")}, p, pid, jid, parent)
         elif request.get("kind") == "printable":
             if not parent:
                 raise ValueError("Generate a design first")
