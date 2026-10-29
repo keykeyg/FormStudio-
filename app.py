@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 import mesh_mode  # noqa: E402
 import photo_tools  # noqa: E402
 import slicer  # noqa: E402
+import design_tools  # noqa: E402
 # Projects live next to the app, so they're easy to find and back up. FORM_STUDIO_DATA overrides.
 DATA = Path(os.environ.get("FORM_STUDIO_DATA") or (Path(__file__).resolve().parent / "data"))
 LOCK = threading.Lock()
@@ -120,7 +121,7 @@ def defaults():
             "bed": [256, 256, 260], "timeout": 900, "max_tokens": 8192, "disable_thinking": True,
             "max_attempts": 4, "self_review_rounds": 3, "bambu_path": "",
             "comfy_root": mesh_mode.default_comfy_root(), "comfy_url": "http://127.0.0.1:8188", "mesh_workflow": str(ROOT / "workflows" / "trellis2_mesh.json"),
-            "fit_clearance": 0.2, "material": "PLA", "walls": 2, "infill": 15}
+            "fit_clearance": 0.2, "material": "PLA", "walls": 2, "infill": 15, "plate": "Textured PEI Plate", "planner": True, "team_reviewer": "other"}
 
 
 def config():
@@ -993,7 +994,7 @@ def slice_turn(cfg, request, p, pid, jid, parent):
     update_job(jid, phase=f"Slicing for the X2D ({material}, {walls} walls, {infill}% infill)")
     flow = getattr(subprocess, "DETACHED_PROCESS", 0)
     try:
-        target, est = slicer.slice_pieces(exe, pieces, project_path(pid) / parent / "print", material, walls, infill)
+        target, est = slicer.slice_pieces(exe, pieces, project_path(pid) / parent / "print", material, walls, infill, plate=cfg.get("plate") or slicer.PLATES[0])
     except (ValueError, OSError, subprocess.TimeoutExpired, KeyError) as exc:
         if not request.get("open", True):
             raise
@@ -1140,6 +1141,244 @@ def scheduler_loop():
             pass
 
 
+# ---- Mesh tools, the planner, import/combine and team review ----
+
+def mesh_op(cfg, *args, timeout=600):
+    cmd = [cfg["cad_python"], "-I", "-B", str(ROOT / "mesh_ops.py"), *map(str, args)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("The mesh operation took too long.") from exc
+    if r.returncode != 0:
+        raise ValueError((r.stderr or r.stdout).strip()[-1500:])
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def new_folder(pid):
+    return project_path(pid) / ("v-" + uuid.uuid4().hex[:12])
+
+
+def require_mesh(p, parent):
+    pv = version_of(p, parent) if parent else None
+    if not pv:
+        raise ValueError("Make or import a design first")
+    if not pv.get("mesh"):
+        raise ValueError("This version is CAD: change its size under Dimensions or ask in chat.")
+    return pv
+
+
+def size_text(dims):
+    return " × ".join(f"{round(x, 1):g}" for x in dims) + " mm"
+
+
+def resize_turn(cfg, plan, p, pid, jid, parent, label="Resize"):
+    pv = require_mesh(p, parent)
+    factors = design_tools.resize_factors(pv["dimensions"], plan)
+    update_job(jid, phase="Resizing the mesh")
+    folder = new_folder(pid)
+    meta = mesh_op(cfg, "scale", project_path(pid) / parent / "model.stl", folder, *factors)
+    same = len({round(f, 6) for f in factors}) == 1
+    how = f"scaled {factors[0] * 100:.4g}%" if same else "scaled X " + ", ".join(f"{'XYZ'[i]} {f * 100:.4g}%" for i, f in enumerate(factors)).split(", ", 1)[1]
+    note = " Holes and other cut-in features scaled too; check their sizes." if pv.get("tools") else ""
+    commit_version(p, folder, "", meta, f"Resized: {size_text(meta['dimensions'])} ({how}).{note}", label, parent)
+
+
+def stretch_turn(cfg, plan, p, pid, jid, parent, label="Stretch"):
+    require_mesh(p, parent)
+    update_job(jid, phase="Stretching the mesh")
+    folder = new_folder(pid)
+    axis = str(plan["axis"]).lower()
+    meta = mesh_op(cfg, "stretch", project_path(pid) / parent / "model.stl", folder, axis, plan["at"], plan["by"])
+    band = meta.get("stretched", {}).get("band", ["?", "?"])
+    commit_version(p, folder, "", meta, f"{'Lengthened' if plan['by'] > 0 else 'Shortened'} by {abs(plan['by']):g} mm along {axis.upper()} "
+                   f"(only {axis.upper()} {band[0]}..{band[1]} mm was stretched; the rest moved unchanged). Now {size_text(meta['dimensions'])}.", label, parent)
+
+
+def copy_parts(src, dst):
+    dst.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src / "parts", dst / "parts", dirs_exist_ok=True)
+    shutil.copy2(src / "parts.json", dst / "parts.json")
+
+
+def place_turn(cfg, plan, p, pid, jid, parent, label="Place"):
+    pv = require_mesh(p, parent)
+    src = project_path(pid) / parent
+    if not (src / "parts.json").is_file():
+        raise ValueError("This design is a single piece, so there's nothing to move. Import another model to combine.")
+    parts, name = design_tools.place(json.loads((src / "parts.json").read_text(encoding="utf-8")), plan)
+    update_job(jid, phase=f"Moving {name}")
+    folder = new_folder(pid)
+    copy_parts(src, folder)
+    (folder / "parts.json").write_text(json.dumps(parts, indent=1), encoding="utf-8")
+    meta = mesh_op(cfg, "assemble", folder)
+    commit_version(p, folder, "", meta, f"Moved {name}. The combined design is {size_text(meta['dimensions'])}" +
+                   ("." if meta["solids"] == 1 else f" in {meta['solids']} separate pieces; move them so they touch to join them."), label, parent)
+
+
+IMPORT_TYPES = {".stl", ".3mf", ".obj", ".ply", ".glb"}
+
+
+def import_turn(cfg, request, p, pid, jid, parent):
+    name = Path(str(request.get("name", "model.stl"))).name[:80]
+    suffix = Path(name).suffix.lower()
+    if suffix not in IMPORT_TYPES:
+        raise ValueError("Import an STL, 3MF, OBJ, PLY or GLB file")
+    m = re.fullmatch(r"data:[^,]*;base64,([A-Za-z0-9+/=\r\n]+)", str(request.get("data", "")))
+    if not m:
+        raise ValueError("The file didn't arrive; try again")
+    raw = base64.b64decode(m[1], validate=True)
+    work = project_path(pid) / "imports"
+    work.mkdir(exist_ok=True)
+    src = work / (uuid.uuid4().hex[:8] + suffix)
+    src.write_bytes(raw)
+    update_job(jid, phase=f"Importing {name}")
+    staged = new_folder(pid)
+    mesh_op(cfg, "import", src, staged)
+    parts = json.loads((staged / "parts.json").read_text(encoding="utf-8"))
+    pv = version_of(p, parent) if parent else None
+    if request.get("add") and pv:
+        # Combine: the current design becomes a part (or keeps its parts), the import goes beside it on +X.
+        folder = new_folder(pid)
+        base = project_path(pid) / parent
+        if (base / "parts.json").is_file():
+            copy_parts(base, folder)
+            existing = json.loads((folder / "parts.json").read_text(encoding="utf-8"))
+        else:
+            (folder / "parts").mkdir(parents=True)
+            shutil.copy2(base / "model.stl", folder / "parts" / "base.stl")
+            existing = [{"name": (p["name"] if p["name"] != "Untitled design" else "design")[:40], "file": "parts/base.stl", "translate": [0.0, 0.0, 0.0], "rotate": [0.0, 0.0, 0.0]}]
+        right = max(b[1] for b in (pv.get("solid_boxes") or [[0, pv["dimensions"][0] / 2]]))
+        names = {e["name"] for e in existing}
+        for i, part in enumerate(parts):
+            dst = f"parts/i{uuid.uuid4().hex[:6]}.stl"
+            shutil.copy2(staged / part["file"], folder / dst)
+            label = part["name"] if part["name"] not in names else f"{part['name']} {i + 2}"
+            existing.append({"name": label, "file": dst, "translate": [float(v) for v in part["translate"]], "rotate": [0.0, 0.0, 0.0]})
+        shutil.rmtree(staged, ignore_errors=True)
+        (folder / "parts.json").write_text(json.dumps(existing, indent=1), encoding="utf-8")
+        update_job(jid, phase="Combining")
+        meta = mesh_op(cfg, "assemble", folder)
+        # Shift new parts so they sit just right of the old design (their true widths are known now).
+        added = meta.get("parts", [])[len(existing) - len(parts):]
+        if added:
+            shift = right + 10.0 - min(a["box"][0] for a in added)
+            for e in existing[len(existing) - len(parts):]:
+                e["translate"][0] += shift
+            (folder / "parts.json").write_text(json.dumps(existing, indent=1), encoding="utf-8")
+            meta = mesh_op(cfg, "assemble", folder)
+        listing = ", ".join(f"\"{x['name']}\"" for x in meta.get("parts", []))
+        commit_version(p, folder, "", meta, f"Added {name} next to the design. Parts: {listing}. Say where it goes, e.g. "
+                       f"\"put {parts[0]['name']} on top, centered\", or ask for slots and holes.", "Import", parent)
+    else:
+        if p["name"] == "Untitled design":
+            p["name"] = Path(name).stem[:45]
+        meta = json.loads((staged / "metadata.json").read_text(encoding="utf-8"))
+        shown = f" in {len(parts)} parts" if len(parts) > 1 else ""
+        commit_version(p, staged, "", meta, f"Imported {name}{shown}: {size_text(meta['dimensions'])}"
+                       f"{'' if meta['valid'] else ' (not watertight; cuts may need a repair first)'}. Change its size under Dimensions, "
+                       "or describe changes in chat.", "Import", parent)
+
+
+def planner_turn(cfg, model, content, p, pid, jid, parent, label=""):
+    """Route a chat request on a mesh version to the right tool. Returns True if it handled the request."""
+    pv = version_of(p, parent)
+    plan = design_tools.quick_plan(content, pv)
+    raw = ""
+    if plan is None:
+        update_job(jid, phase="Planning")
+        recent = [m for m in p["messages"][-6:-1] if not m.get("failed")]
+        messages = [{"role": "system", "content": design_tools.PLANNER_SYSTEM},
+                    {"role": "user", "content": design_tools.context(pv, content, recent)}]
+        raw = infer(dict(cfg, max_tokens=700, temperature=0.1), model, messages, jid)
+        (project_path(pid) / "turns").mkdir(exist_ok=True)
+        (project_path(pid) / "turns" / f"{jid}-plan.txt").write_text(raw, encoding="utf-8")
+        plan = design_tools.parse_plan(raw)
+    if plan is None:
+        return False  # fall back to the normal design turn
+    tool = plan["tool"]
+    if tool in ("resize", "scale"):
+        resize_turn(cfg, plan, p, pid, jid, parent, label or "Planner · resize")
+    elif tool == "stretch":
+        stretch_turn(cfg, plan, p, pid, jid, parent, label or "Planner · stretch")
+    elif tool == "place":
+        place_turn(cfg, plan, p, pid, jid, parent, label or "Planner · place")
+    elif tool == "cad":
+        return "cad", plan["request"]
+    else:
+        p["messages"].append({"role": "assistant", "text": plan.get("question") or plan.get("text"), "time": time.time()})
+        save_project(p)
+    return True
+
+
+REVIEW = """TEAM REVIEW. Another model made the current version for this request:
+"{request}"
+You are the reviewer. Check the program against every size and feature the person asked for, the print-fit rules and the measured facts: size X={x:g} Y={y:g} Z={z:g} mm, {solids} solid(s).
+{problems}If the design is right, reply with APPROVED and one sentence. Otherwise reply with one short sentence on what you fixed, then the complete corrected program in one ```python block."""
+
+
+def team_turn(cfg, request, p, pid, jid, parent, content, messages):
+    """Like the overnight runner: one model drafts, the other reviews and fixes; both versions are kept."""
+    maker = str(request.get("model", ""))
+    if not design_turn(cfg, maker, messages, p, pid, jid, parent, label="Maker"):
+        return
+    drafted = version_of(p, p["active"])
+    choice = str(cfg.get("team_reviewer") or "other")
+    if choice == "same":  # fresh eyes: same model, new context, no model swap
+        reviewer, key = {"name": "fresh-eyes reviewer"}, maker
+    else:
+        loaded = {m["id"] for m in loaded_models(cfg)}
+        others = [m for m in loadable_models(cfg) if m["key"] != maker and m["key"] not in loaded]
+        named = [m for m in loadable_models(cfg) if m["name"] == choice and m["key"] != maker]
+        pick = (named or others or [None])[0]
+        if not pick:
+            p["messages"].append({"role": "assistant", "text": "Team review skipped: there's no second model in your runner's config. Set Team reviewer to \"Same model\" in Settings.", "time": time.time()})
+            save_project(p)
+            return
+        reviewer = pick
+        update_job(jid, phase=f"Loading the reviewer ({reviewer['name']})")
+        key = load_model(cfg, reviewer["name"], jid)
+    src_file = project_path(pid) / drafted["id"] / "model.py"
+    code = src_file.read_text(encoding="utf-8") if src_file.is_file() else ""
+    user_texts = [m["text"] for m in p["messages"] if m["role"] == "user"]
+    found = defects(drafted, code, user_texts)
+    # Text-only, like the overnight runner's code review: the maker already checked the renders against the photos,
+    # and vision prefill on a second (often CPU-offloaded) model can take many minutes.
+    text = REVIEW.format(request=content[:1500], x=drafted["dimensions"][0], y=drafted["dimensions"][1], z=drafted["dimensions"][2],
+                         solids=drafted.get("solids", 1), problems="".join("PROBLEM: " + f + "\n" for f in found))
+    notes = next((m["text"] for m in reversed(p["messages"]) if m.get("version") == drafted["id"]), "")
+    review = [{"role": "system", "content": SYSTEM + fit_rules(cfg)},
+              {"role": "user", "content": text + "\n\nThe maker's notes: " + notes[:1500] + "\n\nCURRENT SOURCE:\n```python\n" + code + "\n```"}]
+    update_job(jid, phase=f"{reviewer['name']} is reviewing")
+    raw = infer(cfg, key, review, jid)
+    (project_path(pid) / "turns" / f"{jid}-review.txt").write_text(raw, encoding="utf-8")
+    try:
+        reply = parse_reply(raw)
+    except ValueError:
+        reply = {"message": raw.strip()[:400], "code": ""}
+    if not reply["code"]:
+        p["messages"].append({"role": "assistant", "text": f"[Reviewer · {reviewer['name']}] " + (reply["message"] or "APPROVED"), "time": time.time()})
+        save_project(p)
+        return
+    folder = new_folder(pid)
+    update_job(jid, phase="Building the reviewer's fix")
+    try:
+        meta = build_cad(cfg, reply["code"], folder)
+    except ValueError as exc:
+        p["messages"].append({"role": "assistant", "text": f"[Reviewer · {reviewer['name']}] proposed a fix that didn't build ({str(exc)[:200]}); keeping the maker's version.", "time": time.time()})
+        save_project(p)
+        return
+    commit_version(p, folder, reply["code"], meta, f"[Reviewer · {reviewer['name']}] " + reply["message"], reviewer["name"], drafted["id"])
+    worse = severity(defects(meta, reply["code"], user_texts)) > severity(found)
+    if worse:
+        p["active"] = drafted["id"]
+    p["messages"].append({"role": "assistant", "time": time.time(), "text":
+                          f"Team: the maker's version {drafted['number']} and the reviewer's version {p['versions'][-1]['number']} are both saved. "
+                          + (f"Kept version {drafted['number']} as current: the reviewer's fix measured worse." if worse
+                             else f"Version {p['versions'][-1]['number']} is current. Restore the other from Versions if you prefer it.")
+                          + (f" {reviewer['name']} stays loaded." if key != maker else "")})
+    save_project(p)
+
+
 def job_run(jid, pid, request, cfg):
     try:
         p = read_project(pid)
@@ -1189,6 +1428,14 @@ def job_run(jid, pid, request, cfg):
             slice_turn(cfg, request, p, pid, jid, parent)
         elif request.get("kind") == "variations":
             variations_turn(cfg, request, p, pid, jid, parent)
+        elif request.get("kind") == "resize":
+            size = request.get("size") or [None, None, None]
+            plan = {"tool": "resize", "size": [float(v) if v not in (None, "") else None for v in size][:3], "lock": bool(request.get("lock", True))}
+            if not design_tools.valid(plan):
+                raise ValueError("Enter at least one size above 0 mm")
+            resize_turn(cfg, plan, p, pid, jid, parent)
+        elif request.get("kind") == "import":
+            import_turn(cfg, request, p, pid, jid, parent)
         elif request.get("kind") == "printable":
             if not parent:
                 raise ValueError("Generate a design first")
@@ -1219,11 +1466,22 @@ def job_run(jid, pid, request, cfg):
             if p["name"] == "Untitled design":
                 p["name"] = content[:45]
             save_project(p)
-            messages = build_messages(p, pid, parent, content, cfg)
-            if request.get("kind") == "compare":
-                compare_models(cfg, messages, p, pid, jid, parent)
-            else:
-                design_turn(cfg, str(request.get("model", "")), messages, p, pid, jid, parent)
+            pv = version_of(p, parent) if parent else None
+            handled = False
+            if pv and pv.get("mesh") and cfg.get("planner", True) and request.get("kind") not in ("compare", "team"):
+                handled = planner_turn(cfg, str(request.get("model", "")), content, p, pid, jid, parent)
+                if isinstance(handled, tuple):  # a CAD request (the planner may have restated it precisely)
+                    if handled[1].strip() != content.strip():
+                        content = content + "\n(Planner: " + handled[1] + ")"
+                    handled = False
+            if not handled:
+                messages = build_messages(p, pid, parent, content, cfg)
+                if request.get("kind") == "compare":
+                    compare_models(cfg, messages, p, pid, jid, parent)
+                elif request.get("kind") == "team" and not (pv and pv.get("mesh")):
+                    team_turn(cfg, request, p, pid, jid, parent, content, messages)
+                else:
+                    design_turn(cfg, str(request.get("model", "")), messages, p, pid, jid, parent)
         update_job(jid, status="done", phase="Ready", project=public_project(p))
     except Cancelled:
         note_failure(pid, request, "Stopped before finishing. The previous version is unchanged.")
@@ -1464,6 +1722,12 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["fit_clearance"] = float(obj["fit_clearance"])
                 if obj.get("material") in slicer.MATERIALS:
                     cfg["material"] = obj["material"]
+                if obj.get("plate") in slicer.PLATES:
+                    cfg["plate"] = obj["plate"]
+                if "planner" in obj:
+                    cfg["planner"] = bool(obj["planner"])
+                if obj.get("team_reviewer"):
+                    cfg["team_reviewer"] = str(obj["team_reviewer"])[:80]
                 bed = obj.get("bed", cfg["bed"])
                 if len(bed) != 3 or not all(1 <= float(x) <= 5000 for x in bed):
                     raise ValueError("Enter three valid bed dimensions")

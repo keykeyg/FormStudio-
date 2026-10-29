@@ -50,6 +50,10 @@ No cloud, no accounts, no telemetry. Photos, models and history stay in a folder
 | **Slice → Bambu** | Slices with Bambu Studio's command line and its own X2D presets, then opens the sliced plate in Bambu Studio so you can press Print. You get the exact time and grams. |
 | **Mesh mode** | Photo → TRELLIS.2 (ComfyUI) → repaired, real-size mesh. |
 | **CAD edits on meshes** | Ask for holes, slots, flat bases or tabs on a sculpted mesh. The model writes CAD cut/add solids and Form Studio applies them as exact mesh booleans. |
+| **Mesh size fields** | Sculpted and imported models get X / Y / Z size boxes with **Keep proportions**. Type 216 mm and it scales right away, with no AI involved. |
+| **Planner** | On meshes, your chat is routed to the right tool: resize, stretch one section, move a part, cut/add material, ask a question, or just answer. "The 912 mm needs to be 216" or "make it 180 mm long" are handled instantly by rules; anything else goes through a short text-only call to the local model. |
+| **Import + combine** | Bring in STL / 3MF / OBJ / PLY / GLB files, e.g. from MakerWorld. Start a new design with one, or add it to the current design as a separate part, then say where it goes ("put the spool holder on top, centered") and add slots or holes. |
+| **Team review** | Like the overnight runner: your selected model designs it, your other model reviews it against your photos and sizes and fixes it. Both versions are kept, and the measurably better one stays current. |
 | **Compare** | Runs the same request on each of your models, one after the other, and keeps every result as a version. |
 | **Variations** | Several independent attempts, split across your models at different temperatures. Each one is self-checked, the best becomes current, and the run can be scheduled for overnight. |
 | **Phone access** | Optional, passcode-protected access from your phone on the home network or Tailscale, with a one-tap **Camera** button. |
@@ -178,6 +182,8 @@ It's asked to keep these values as named parameters, so you can tweak them under
 - The **estimate** under Dimensions computes weight, cost and time in the browser from the model's real surface area and volume, using your material, wall and infill choices. It's a quick guide.
 - **Slice → Bambu** makes the print pieces if needed and slices them with `bambu-studio.exe`. It uses the X2D 0.4 nozzle machine preset, the `0.20mm Standard @BBL X2D` process and the Bambu filament preset for your material, with your wall and infill settings. Then it opens the sliced plate in Bambu Studio, ready to print. The exact time and grams are saved with the version. Bambu's system presets inherit from parents and pull in g-code templates, so `slicer.py` flattens them into complete settings files first. If command-line slicing fails, Form Studio opens the pieces in Bambu Studio instead and tells you why.
 
+The build plate comes from **Settings → Build plate** (Textured PEI by default). Without it, Bambu's command line assumes the Cool Plate, which rejects PETG, ABS and ASA.
+
 Materials: PLA, PLA Matte, PLA Tough, PETG (HF), ABS, ASA, TPU 95A HF, PLA-CF, PETG-CF, PA6-CF.
 
 ### Mesh mode (TRELLIS.2) and CAD edits on meshes
@@ -203,6 +209,40 @@ TRELLIS meshes usually have stacked or leaky triangles. If the mesh isn't watert
 **No manual workflow export is needed.** `workflows/trellis2_mesh.json` is ComfyUI-Trellis2's *MeshOnly* editor workflow. On each run Form Studio asks the running ComfyUI for its node definitions (`/object_info`) and converts the editor file to API format. It handles seed "control" values, linked widgets, reroutes and newer inputs, and queues only the nodes that feed the export. Overrides in the file's `extra.formstudio` block set the image input, background removal, face count (200k) and file name.
 
 **CAD on a mesh.** Chat with a mesh version active ("drill two 5 mm holes 40 mm apart through the top", "add a flat base"). The model writes CadQuery that defines `cut` and/or `add` solids in the mesh's coordinates, and `mesh_ops.py` applies them with manifold3d. Their parameters show up under Dimensions too: change `HOLE_D` and the cut is reapplied to the same base mesh.
+
+### Resize, stretch and talk to meshes (the planner)
+
+A mesh (from Mesh mode or an import) has no source code, so typing "the dimensions are off" used to dead-end. Now:
+
+- **Dimensions → Size**: type the size you want in X, Y or Z. With **Keep proportions** on, the other two follow as you type; turn it off to change one direction only. Click **Resize ↗**.
+- **Just say it.** The planner turns what you write into one operation:
+
+| You say | It does |
+|---|---|
+| "the 912 mm needs to be 216" | scales everything by 216/912 (rule, instant) |
+| "make it 180 mm long" / "120 mm tall" | resizes with proportions locked (rule, instant) |
+| "make the butt 10 mm longer" (optionally click the spot with ◎ Point) | stretches only a band around that spot; the ends keep their shape |
+| "put the spool holder on top, centered" | moves that part of a combined design |
+| "add two 5 mm holes 40 mm apart through the top" | precise CAD cut on the mesh |
+| "how long is it?" | answers without changing anything |
+
+The planner only asks a question when it truly can't act. Turn it off in Settings if you want every message to go straight to CAD edits.
+
+### Import STL / 3MF and combine
+
+**⇪ Import** (next to Photo) takes STL, 3MF (including Bambu/MakerWorld files with components and per-object model files), OBJ, PLY and GLB, up to 25 MB.
+- With a design open, it asks whether to **combine** (the file is added as a separate part beside your design) or **start a new project**.
+- Each part keeps its own position; the planner moves them ("move the bracket 20 mm left", "rotate the holder 90 degrees"). Parts that touch are joined into one printable solid.
+- After combining, ask for features across the whole thing: "add a slot for a build plate, 260 mm wide and 2 mm tall, through the back". Cuts bake the parts into one piece; resizing does too.
+
+### Team review
+
+Turn on **⚖ Team** and send a request. Form Studio then:
+1. builds it with your selected model, with the usual self-check
+2. loads your other model from the builder's config
+3. has that model review the result against your photos, your sizes and the measured problems, and fix it if needed
+
+Both versions are kept. The reviewer's version becomes current unless it measures worse. The reviewer stays loaded afterwards. Team review applies to CAD designs; meshes go through the planner.
 
 ### Compare and Variations (including overnight)
 
@@ -238,7 +278,8 @@ photo_tools.py         OpenCV install check + worker calls
 slicer.py              Bambu Studio preset flattening + CLI slicing
 mesh_mode.py           ComfyUI / TRELLIS.2 runner + editor→API workflow conversion
 mesh_worker.py         repair and scale TRELLIS meshes
-mesh_ops.py            CAD booleans on meshes
+mesh_ops.py            mesh tools: CAD booleans, scale, stretch, STL/3MF import (stdlib 3MF reader), part assembly
+design_tools.py        the planner: rules, prompt, JSON checks, part placement
 templates/             part templates (plain CadQuery)
 workflows/             TRELLIS.2 workflow
 static/                UI: index.html, app.js, viewer.js (WebGL STL viewer + picking), style.css

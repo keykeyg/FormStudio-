@@ -596,6 +596,103 @@ class Integration(unittest.TestCase):
         self.assertIsNone(app.mesh_size('make cad'))
         self.assertIsNone(app.mesh_size('a 6 mm pin hole and 25 mm wide'))
 
+    def mesh_project(self, extents=(60, 40, 20)):
+        import trimesh
+        p=self.request('/api/projects',{})
+        pr=app.read_project(p['id'])
+        folder=app.project_path(p['id'])/('v-'+'b'*12); folder.mkdir(parents=True)
+        trimesh.creation.box(extents=extents).apply_translation((0,0,extents[2]/2)).export(folder/'model.stl')
+        meta={'dimensions':list(extents),'volume':float(extents[0]*extents[1]*extents[2]),'solids':1,'valid':True,'mesh':True,'faces':12,
+              'solid_boxes':[[-extents[0]/2,extents[0]/2,-extents[1]/2,extents[1]/2,0,extents[2]]]}
+        app.commit_version(pr,folder,'',meta,'Mesh from TRELLIS.2','TRELLIS.2',None)
+        return p['id']
+
+    def test_mesh_size_fields_and_planner_rules(self):
+        pid=self.mesh_project((494,926,104))
+        r=self.wait(pid,{'kind':'resize','size':[None,216,None],'lock':True})
+        self.assertEqual(r['status'],'done',r.get('error'))
+        v=r['project']['versions'][-1]; self.assertAlmostEqual(v['dimensions'][1],216,places=1); self.assertAlmostEqual(v['dimensions'][0],494*216/926,places=1)
+        r=self.wait(pid,{'kind':'resize','size':[100,216,30],'lock':False})
+        self.assertEqual([round(x) for x in r['project']['versions'][-1]['dimensions']],[100,216,30])
+        # Chat on a mesh: plain size requests are handled by rules, with no model call.
+        before=len(MockLM.requests)
+        r=self.wait(pid,{'message':'the 216 mm needs to be 108','model':'test-vision'})
+        self.assertEqual(r['status'],'done',r.get('error')); self.assertEqual(len(MockLM.requests),before)
+        self.assertAlmostEqual(r['project']['versions'][-1]['dimensions'][1],108,places=1)
+
+    def test_planner_routes_stretch_answer_and_cad(self):
+        pid=self.mesh_project((100,40,20))
+        MockLM.replies=['{"tool":"stretch","axis":"x","at":20,"by":15}']
+        r=self.wait(pid,{'message':'make the right end 15 mm longer','model':'test-vision'})
+        self.assertEqual(r['status'],'done',r.get('error')); v=r['project']['versions'][-1]
+        self.assertAlmostEqual(v['dimensions'][0],115,places=1); self.assertIn('Lengthened by 15',r['project']['messages'][-1]['text'])
+        self.assertIn('PLANNER' if False else 'Pick exactly one tool',MockLM.requests[-1]['messages'][0]['content'])
+        self.assertNotIn('image_url',json.dumps(MockLM.requests[-1]))  # the planner call is text-only
+        MockLM.replies=['{"tool":"answer","text":"It is 115 mm long."}']
+        r=self.wait(pid,{'message':'how long is it now?','model':'test-vision'})
+        self.assertEqual(r['project']['messages'][-1]['text'],'It is 115 mm long.')
+        MockLM.replies=['{"tool":"cad","request":"Drill a 5 mm hole through Z at X=0, Y=0"}',
+                        'Hole.\n```python\nimport cadquery as cq\ncut = cq.Workplane("XY").circle(2.5).extrude(100).translate((0, 0, -10))\n```']
+        r=self.wait(pid,{'message':'put a hole in the middle','model':'test-vision'})
+        self.assertEqual(r['status'],'done',r.get('error')); self.assertTrue(r['project']['versions'][-1]['tools'])
+        self.assertIn('Planner: Drill a 5 mm hole',json.dumps(MockLM.requests[-1]['messages'][-1]['content']))
+
+    def test_import_3mf_combine_and_place(self):
+        import trimesh, zipfile, io
+        def mesh_xml(m):
+            v=''.join(f'<vertex x="{a}" y="{b}" z="{c}"/>' for a,b,c in m.vertices); t=''.join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a,b,c in m.faces)
+            return f'<mesh><vertices>{v}</vertices><triangles>{t}</triangles></mesh>'
+        model=f'''<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources>
+<object id="1" name="Spool holder" type="model">{mesh_xml(trimesh.creation.box((30,30,10)))}</object></resources><build><item objectid="1" transform="1 0 0 0 1 0 0 0 1 128 128 5"/></build></model>'''
+        buf=io.BytesIO(); z=zipfile.ZipFile(buf,'w'); z.writestr('3D/3dmodel.model',model); z.close()
+        data='data:application/octet-stream;base64,'+base64.b64encode(buf.getvalue()).decode()
+        p=self.request('/api/projects',{})
+        r=self.wait(p['id'],{'kind':'import','name':'holder.3mf','data':data})
+        self.assertEqual(r['status'],'done',r.get('error')); self.assertEqual([round(x) for x in r['project']['versions'][-1]['dimensions']],[30,30,10])
+        pid=self.mesh_project((60,40,20))
+        r=self.wait(pid,{'kind':'import','name':'holder.3mf','data':data,'add':True})
+        self.assertEqual(r['status'],'done',r.get('error')); v=r['project']['versions'][-1]
+        self.assertEqual([x['name'] for x in v['parts']],['design','Spool holder']); self.assertEqual(v['solids'],2)
+        MockLM.replies=['{"tool":"place","part":"spool holder","translate":[0,0,20]}']
+        r=self.wait(pid,{'message':'put the spool holder on top, centered','model':'test-vision'})
+        self.assertEqual(r['status'],'done',r.get('error')); v=r['project']['versions'][-1]
+        self.assertEqual(v['solids'],1); self.assertEqual([round(x) for x in v['dimensions']],[60,40,30])
+        bad=self.wait(pid,{'kind':'import','name':'notes.txt','data':data})
+        self.assertEqual(bad['status'],'error')
+
+    def test_team_review_keeps_both_versions(self):
+        saved=(app.loadable_models,app.load_model,app.loaded_models)
+        state={'loaded':['test-vision']}
+        app.loadable_models=lambda cfg:[{'name':'maker','key':'test-vision'},{'name':'reviewer','key':'reviewer-model'}]
+        app.loaded_models=lambda cfg:[{'id':k,'name':k,'vision':True} for k in state['loaded']]
+        def load(cfg,name,jid):
+            state['loaded']=['reviewer-model']; return 'reviewer-model'
+        app.load_model=load
+        try:
+            p=self.request('/api/projects',{})
+            MockLM.replies=['Cube.\n```python\nimport cadquery as cq\nLENGTH = 10.0\nresult = cq.Workplane().box(LENGTH, 10, 10)\n```',
+                            'Made it 20 long as asked.\n```python\nimport cadquery as cq\nLENGTH = 20.0\nresult = cq.Workplane().box(LENGTH, 10, 10)\n```']
+            r=self.wait(p['id'],{'kind':'team','message':'A block 20 mm long','model':'test-vision'})
+            self.assertEqual(r['status'],'done',r.get('error'))
+            pr=r['project']; self.assertEqual(len(pr['versions']),2)
+            self.assertEqual(pr['active'],pr['versions'][-1]['id']); self.assertEqual(pr['versions'][-1]['model'],'reviewer')
+            self.assertEqual(MockLM.requests[-1]['model'],'reviewer-model'); self.assertIn('TEAM REVIEW',json.dumps(MockLM.requests[-1]['messages'][-1]['content']))
+            self.assertNotIn('image_url',json.dumps(MockLM.requests[-1]))  # the review is text-only (fast on an offloaded model)
+            self.assertIn('Team:',pr['messages'][-1]['text'])
+            # Fresh eyes: same model, new context, no swap.
+            saved_cfg=json.loads((app.DATA/'settings.json').read_text())
+            app.atomic(app.DATA/'settings.json',{**saved_cfg,'team_reviewer':'same'})
+            state['loaded']=['test-vision']; app.load_model=lambda *a: self.fail('no model swap expected')
+            try:
+                MockLM.replies=['Plate.\n```python\nimport cadquery as cq\nresult = cq.Workplane().box(30, 20, 3)\n```','APPROVED: matches.']
+                r=self.wait(self.request('/api/projects',{})['id'],{'kind':'team','message':'A 30 x 20 x 3 mm plate','model':'test-vision'})
+                self.assertEqual(r['status'],'done',r.get('error')); self.assertEqual(MockLM.requests[-1]['model'],'test-vision')
+                self.assertIn('fresh-eyes reviewer',r['project']['messages'][-1]['text'])
+            finally:
+                app.atomic(app.DATA/'settings.json',saved_cfg)
+        finally:
+            app.loadable_models,app.load_model,app.loaded_models=saved
+
     def test_size_hints(self):
         self.assertEqual(app.size_hints({'LENGTH':100.0,'WIDTH':30.0,'HEIGHT':45.0,'HOLE_D':5.0},[100,15,45]),
                          ['WIDTH = 30, but no overall dimension matches it (bounding box X=100, Y=15, Z=45 mm).'])

@@ -68,3 +68,12 @@ On the PC (Windows, Python 3.14 cadenv, Bambu Studio 02.08.02.61, ComfyUI 0.30 p
 In the container: 28 integration tests pass (Linux, Python 3.13, CadQuery 2.8.0, OpenCV 4.11; mock LM Studio, mock ComfyUI, fake bambu-studio).
 - Mesh mode end to end on the grip photo: ~5 min TRELLIS.2 run, 100 x 29.2 x 52.9 mm, 200k triangles; the raw mesh had stacked/leaky triangles, so it was rebuilt watertight (voxel + VTK flying edges + smoothing + decimation). The quad-remesh workflow pass was kept (it removes floaters and inner faces and was faster overall).
 - CAD edit on that mesh with 27B: "two 5.3 mm holes, 40 mm apart, through the top flange" -> cut solids applied with manifold3d; volume dropped by 429 mm^3 (two 5.3 mm x ~9.7 mm holes); HOLE_D/HOLE_SPACING became editable parameters.
+
+1.5 (Oct 28, 2026): mesh size fields, planner, STL/3MF import + combine, team review, slicing plate fix.
+On the PC (RTX 3090, Qwen3.8 27B):
+- Planner rule path: "the 912 mm needs to be 216" on the B&T stock mesh scaled it 23.68% to 117 x 219.2 x 24.7 mm with no model call.
+- Planner model path (27B, text-only, ~5 s): "how tall is it right now?" -> answered 52.89 mm; "make the grip section near the right end 12 mm longer" -> stretch X at 30 mm, band 18..42 mm, 100 -> 112 mm.
+- A real Bambu Studio 3MF (components in 3D/Objects/object_1.model) imported at the right size (54.2 x 100 x 25 mm, watertight).
+- Team review: Flash-Next as reviewer runs at ~4 tok/s (offloaded), so the review is text-only (code + sizes + measured facts) and a "Same model, fresh eyes" reviewer option was added for speed.
+- Slicing now passes the build plate (default Textured PEI); the CLI otherwise assumed the Cool Plate and refused PETG/ABS.
+In the container: 33 integration tests pass (mock LM Studio, mock ComfyUI, fake bambu-studio).
