@@ -121,7 +121,9 @@ def defaults():
             "bed": [256, 256, 260], "timeout": 900, "max_tokens": 8192, "disable_thinking": True,
             "max_attempts": 4, "self_review_rounds": 3, "bambu_path": "",
             "comfy_root": mesh_mode.default_comfy_root(), "comfy_url": "http://127.0.0.1:8188", "mesh_workflow": str(ROOT / "workflows" / "trellis2_mesh.json"),
-            "fit_clearance": 0.2, "material": "PLA", "walls": 2, "infill": 15, "plate": "Textured PEI Plate", "planner": True, "team_reviewer": "same"}
+            "fit_clearance": 0.2, "material": "PLA", "walls": 2, "infill": 15, "plate": "Textured PEI Plate", "planner": True, "team_reviewer": "same",
+            "rebuild_engine": "local", "rebuild_rounds": 2, "rebuild_tolerance": 0.5,
+            "claude_api_key": "", "claude_model": "claude-opus-5-5", "claude_rounds": 2, "claude_url": "https://api.anthropic.com"}
 
 
 def config():
@@ -132,7 +134,8 @@ def config():
 
 
 def public_config():
-    c = {k: v for k, v in config().items() if not k.startswith("remote_pass")}
+    c = {k: v for k, v in config().items() if not k.startswith("remote_pass") and k != "claude_api_key"}
+    c["claude_api_key_set"] = bool(config().get("claude_api_key"))
     c["remote_passcode_set"] = bool(config().get("remote_passcode_hash"))
     c["remote_active"] = REMOTE
     c["remote_urls"] = [f"http://{ip}:{PORT}" for ip in lan_addresses()] if REMOTE or c.get("remote_access") else []
@@ -1392,6 +1395,8 @@ def planner_turn(cfg, model, content, p, pid, jid, parent, label=""):
         place_turn(cfg, plan, p, pid, jid, parent, label or "Planner · place")
     elif tool == "polish":
         polish_turn(cfg, plan, p, pid, jid, parent, label or "Planner · polish")
+    elif tool == "rebuild":
+        rebuild_turn(cfg, {"message": content}, p, pid, jid, parent, model)
     elif tool == "cad":
         return "cad", plan["request"]
     else:
@@ -1469,6 +1474,273 @@ def team_turn(cfg, request, p, pid, jid, parent, content, messages):
     save_project(p)
 
 
+# ---- Rebuild a mesh as CAD: measure, 2.5D baseline, then local model / Claude rounds checked against the mesh ----
+REBUILD_ENGINES = ("local", "chat", "api")
+CLAUDE_MODELS = {"claude-opus-5-5": "Claude Opus 5.5", "claude-sonnet-5-5": "Claude Sonnet 5.5"}
+REBUILD_SYSTEM = '''You have NO tools. Everything you need is below. You rebuild a scanned or AI-generated mesh as clean, parametric CadQuery.
+Reply with one short sentence on what you changed, then the complete program in exactly one ```python block.
+Keep the mesh's own coordinates exactly (millimeters, X and Y centered, base at Z=0): the checker compares your solid with the mesh where it sits.
+Only imports allowed: import cadquery as cq; import math. Assign the finished solid to result. No file access, printing, exporters or importers.
+You get the measurements, the current program (it builds), and a DEVIATION report listing where your CAD has MISSING material (the mesh has it, your CAD doesn't) or EXTRA material (your CAD has it, the mesh doesn't), with coordinates. Fix the biggest regions first and keep everything that already matches.
+Make it read like a designed part: name important sizes as UPPERCASE parameters; where a run of outline points is clearly a straight edge or an arc, you may replace it with that; round holes stay exact circles.
+Where the report shows thin EXTRA material along edges of a band, the mesh's edges are rounded: add small fillets or chamfers last, wrapped in try/except so a failed fillet doesn't lose the part.
+Don't invent features the measurements don't show, and don't move or rescale the part to make the numbers fit.'''
+
+
+def measure_mesh(cfg, pid, ref_id):
+    """Measurements of a mesh version (cached in its folder)."""
+    folder = project_path(pid) / ref_id
+    out = folder / "measure.json"
+    if not out.is_file() or out.stat().st_mtime < (folder / "model.stl").stat().st_mtime:
+        cmd = [cfg["cad_python"], "-I", "-B", str(ROOT / "mesh_measure.py"), "measure", str(folder / "model.stl"), str(out)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            raise ValueError("Couldn't measure the mesh: " + (r.stderr or r.stdout).strip()[-1500:])
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def compare_to_mesh(cfg, cad_folder, mesh_folder, tol):
+    out = cad_folder / "deviation.json"
+    cmd = [cfg["cad_python"], "-I", "-B", str(ROOT / "mesh_measure.py"), "compare", str(cad_folder / "model.stl"), str(mesh_folder / "model.stl"), str(out), str(tol)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode != 0:
+        raise ValueError("Couldn't compare with the mesh: " + (r.stderr or r.stdout).strip()[-1500:])
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def fit_text(dev):
+    return f"{dev['within'] * 100:.0f}% of the surface within ±{dev['tol']:g} mm of the mesh (mean {dev['mean']:g} mm)"
+
+
+def claude_infer(cfg, messages, jid):
+    """Anthropic Messages API, streamed, with the same progress meter as the local models. Images go as base64."""
+    key = str(cfg.get("claude_api_key") or "").strip()
+    if not key:
+        raise ValueError("Add your Anthropic API key under Settings → Claude to use the API engine.")
+    model = cfg.get("claude_model") or "claude-opus-5-5"
+    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    convo = []
+    for m in messages:
+        if m["role"] == "system":
+            continue
+        parts = m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]
+        content = []
+        for part in parts:
+            if part.get("type") == "image_url":
+                head, data = part["image_url"]["url"].split(",", 1)
+                content.append({"type": "image", "source": {"type": "base64", "media_type": head[5:].split(";")[0], "data": data}})
+            elif part.get("text"):
+                content.append({"type": "text", "text": part["text"]})
+        convo.append({"role": m["role"], "content": content})
+    payload = {"model": model, "max_tokens": 16000, "system": system, "messages": convo, "stream": True}
+    url = urllib.parse.urlsplit(cfg.get("claude_url") or "https://api.anthropic.com")
+    kind = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    conn = kind(url.hostname, url.port, timeout=600)
+    with LOCK:
+        CONNS[jid] = conn
+    name = CLAUDE_MODELS.get(model, model)
+    tokens_in = prompt_tokens(messages)
+    started, first, pieces = time.time(), None, []
+    update_job(jid, llm={"model": name, "started": started, "prompt_tokens": tokens_in, "expected_read": None,
+                         "first_token": None, "tokens": 0, "rate": None, "typical_rate": None})
+    try:
+        conn.request("POST", "/v1/messages", body=json.dumps(payload).encode(),
+                     headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+        r = conn.getresponse()
+        if r.status != 200:
+            detail = r.read(3000).decode(errors="replace")
+            try:
+                detail = json.loads(detail)["error"]["message"]
+            except (ValueError, KeyError, TypeError):
+                pass
+            raise ValueError(f"Claude API returned HTTP {r.status}: {detail}")
+        while True:
+            line = r.readline()
+            if not line:
+                break
+            if cancelled(jid):
+                raise Cancelled()
+            if not line.startswith(b"data:"):
+                continue
+            try:
+                event = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            if event.get("type") == "error":
+                raise ValueError("Claude API error: " + str(event.get("error", {}).get("message", event)))
+            if event.get("type") == "content_block_delta" and event.get("delta", {}).get("type") == "text_delta":
+                pieces.append(event["delta"].get("text", ""))
+                if first is None:
+                    first = time.time()
+                elapsed = max(0.5, time.time() - first)
+                written = sum(map(len, pieces))
+                with LOCK:
+                    meter = dict(JOBS.get(jid, {}).get("llm") or {})
+                meter.update(first_token=first, tokens=int(written / 3.6), rate=round(written / 3.6 / elapsed, 1) if elapsed > 2 else None)
+                update_job(jid, characters=written, llm=meter)
+            if event.get("type") == "message_stop":
+                break
+        return "".join(pieces)
+    except (OSError, http.client.HTTPException) as exc:
+        if cancelled(jid):
+            raise Cancelled() from exc
+        raise ValueError(f"Lost the connection to the Claude API: {exc}") from exc
+    finally:
+        with LOCK:
+            CONNS.pop(jid, None)
+            if isinstance(JOBS.get(jid, {}).get("llm"), dict):
+                JOBS[jid]["llm"]["done"] = True
+        conn.close()
+
+
+def rebuild_reference(p, parent):
+    """The mesh a rebuild is measured against: the active version if it's a mesh, else the one the last rebuild used."""
+    pv = version_of(p, parent) if parent else None
+    if pv and pv.get("mesh"):
+        return parent
+    ref = (p.get("rebuild") or {}).get("reference")
+    if ref and version_of(p, ref):
+        return ref
+    raise ValueError("Pick a mesh version first (a TRELLIS.2 mesh, an import or a scan), then Rebuild as CAD.")
+
+
+def rebuild_commit(cfg, p, pid, jid, ref_id, code, message, label, tol):
+    """Build a candidate, measure it against the mesh and keep it as a version. Returns (version, deviation)."""
+    folder = new_folder(pid)
+    meta = build_cad(cfg, code, folder)
+    update_job(jid, phase="Comparing with the mesh")
+    dev = compare_to_mesh(cfg, folder, project_path(pid) / ref_id, tol)
+    meta["rebuild"] = {"reference": ref_id, "mean": dev["mean"], "within": dev["within"], "tol": tol, "by": label}
+    version = commit_version(p, folder, code, meta, f"{message} {fit_text(dev)[0].upper() + fit_text(dev)[1:]}.", label, p["active"])
+    rb = p.setdefault("rebuild", {})
+    if rb.get("reference") != ref_id:
+        rb.clear()
+    rb.update(reference=ref_id, tol=tol)
+    best = version_of(p, rb.get("best")) if rb.get("best") else None
+    if best is None or dev["mean"] <= best["rebuild"]["mean"] * 1.03:
+        rb["best"] = version["id"]
+    save_project(p)
+    return version, dev
+
+
+def rebuild_round(cfg, writer, label, meas, code, dev, note, p, pid, jid, ref_id, tol, images=True):
+    """One writer round: show the measurements, program and deviation; build and check what comes back."""
+    text = (meas["summary"] + "\n\n" + (f"WHAT THE PERSON WANTS: {note}\n\n" if note else "")
+            + "CURRENT PROGRAM (it builds):\n```python\n" + code + "\n```\n\n" + dev["report"]
+            + f"\nGoal: at least 95% of the surface within ±{tol:g} mm, as a clean parametric program.")
+    content = [{"type": "text", "text": text}]
+    best = version_of(p, p["rebuild"]["best"])
+    if images:
+        for name, folder in (("The mesh", project_path(pid) / ref_id), ("Your current CAD", project_path(pid) / best["id"])):
+            if (folder / "view-isometric.png").is_file():
+                content += [{"type": "text", "text": name + " (isometric):"}, image_content(folder / "view-isometric.png")]
+    messages = [{"role": "system", "content": REBUILD_SYSTEM + fit_rules(cfg)}, {"role": "user", "content": content}]
+    for attempt in range(2):
+        raw = writer(messages)
+        (project_path(pid) / "turns").mkdir(exist_ok=True)
+        (project_path(pid) / "turns" / f"{jid}-{re.sub(r'[^A-Za-z0-9]+', '_', label)}-{attempt}.txt").write_text(raw, encoding="utf-8")
+        reply = parse_reply(raw)
+        if not reply["code"]:
+            p["messages"].append({"role": "assistant", "text": f"[{label}] " + reply["message"], "time": time.time()})
+            save_project(p)
+            return None
+        update_job(jid, phase=f"{label}: building")
+        try:
+            return rebuild_commit(cfg, p, pid, jid, ref_id, reply["code"], f"[{label}] {reply['message']}", label, tol) + (reply["code"],)
+        except (ValueError, SyntaxError) as exc:
+            if cancelled(jid):
+                raise Cancelled() from exc
+            messages += [{"role": "assistant", "content": raw},
+                         {"role": "user", "content": "That failed to build. Fix it and reply with the complete corrected program in one ```python block. Error:\n" + str(exc)[-3000:]}]
+    return None
+
+
+def rebuild_turn(cfg, request, p, pid, jid, parent, model):
+    ref_id = rebuild_reference(p, parent)
+    tol = float(request.get("tolerance") or cfg.get("rebuild_tolerance", 0.5))
+    engine = request.get("engine") if request.get("engine") in REBUILD_ENGINES else cfg.get("rebuild_engine", "local")
+    note = str(request.get("message") or "").strip()[:2000]
+    if note:
+        p["messages"].append({"role": "user", "text": "[Rebuild as CAD] " + note, "time": time.time()})
+    update_job(jid, phase="Measuring the mesh (sections, bands, holes)")
+    meas = measure_mesh(cfg, pid, ref_id)
+    update_job(jid, phase="Building the measured CAD")
+    rb = p.get("rebuild") or {}
+    best = version_of(p, rb.get("best")) if rb.get("reference") == ref_id and rb.get("best") else None
+    if best and request.get("continue"):
+        code = (project_path(pid) / best["id"] / "model.py").read_text(encoding="utf-8")
+        dev = json.loads((project_path(pid) / best["id"] / "deviation.json").read_text(encoding="utf-8"))
+        p["active"] = best["id"]
+    else:
+        version, dev = rebuild_commit(cfg, p, pid, jid, ref_id, meas["program"],
+                                      f"Rebuilt as CAD from the mesh's measurements ({len(meas['bands'])} band(s) along {meas['axis']}).", "Rebuild · measured", tol)
+        code = meas["program"]
+    done = []
+    # 1. Local model rounds (always first)
+    rounds = max(0, min(5, int(cfg.get("rebuild_rounds", 2))))
+    loaded = {}
+    if rounds and model and not PREVIEW:
+        try:
+            loaded = {m["id"]: m for m in loaded_models(cfg)}
+        except Exception:
+            loaded = {}
+    if rounds and model in loaded:
+        name = loaded[model].get("name") or model
+        writer = lambda msgs: infer(dict(cfg, temperature=0.2), model, msgs, jid)
+        for i in range(rounds):
+            if dev["within"] >= 0.98:
+                break
+            update_job(jid, phase=f"{name} is refining the CAD ({i + 1}/{rounds})", characters=0)
+            got = rebuild_round(cfg, writer, f"Rebuild · {name}", meas, code, dev, note, p, pid, jid, ref_id, tol, images=loaded[model].get("vision") is not False)
+            if not got:
+                break
+            _, new_dev, new_code = got
+            if new_dev["mean"] <= dev["mean"] * 1.1:  # keep building on it unless it got clearly worse
+                code, dev = new_code, new_dev
+        done.append(f"{name} ({rounds} round{'s' if rounds != 1 else ''} max)")
+    elif rounds:
+        done.append("no local model loaded, so only the measured CAD")
+    # 2. Claude through the API, if chosen and still not close enough
+    if engine == "api" and dev["within"] < 0.98:
+        c_rounds = max(1, min(5, int(cfg.get("claude_rounds", 2))))
+        cname = CLAUDE_MODELS.get(cfg.get("claude_model"), cfg.get("claude_model"))
+        writer = lambda msgs: claude_infer(cfg, msgs, jid)
+        for i in range(c_rounds):
+            if dev["within"] >= 0.98:
+                break
+            update_job(jid, phase=f"{cname} (API) is refining the CAD ({i + 1}/{c_rounds})", characters=0)
+            best_v = version_of(p, p["rebuild"]["best"])
+            code = (project_path(pid) / best_v["id"] / "model.py").read_text(encoding="utf-8")
+            dev = json.loads((project_path(pid) / best_v["id"] / "deviation.json").read_text(encoding="utf-8"))
+            got = rebuild_round(cfg, writer, f"Rebuild · {cname}", meas, code, dev, note, p, pid, jid, ref_id, tol)
+            if not got:
+                break
+            _, dev, code = got
+        done.append(f"{cname} via the API")
+    best = version_of(p, p["rebuild"]["best"])
+    p["active"] = best["id"]
+    text = f"Rebuild as CAD: version {best['number']} is the closest, {fit_text(json.loads((project_path(pid) / best['id'] / 'deviation.json').read_text(encoding='utf-8')))}. Used: measured CAD" + "".join(", " + d for d in done) + "."
+    if engine == "chat":
+        text += (f" To have Claude continue, say this in the Claude app (with the Form Studio connector): "
+                 f"\"Continue the Form Studio rebuild of '{p['name']}'.\"")
+    p["messages"].append({"role": "assistant", "text": text, "time": time.time()})
+    save_project(p)
+
+
+def rebuild_build_turn(cfg, request, p, pid, jid, parent):
+    """Build a program someone else wrote (Claude through the connector) and check it against the rebuild's mesh."""
+    ref_id = request.get("reference") or rebuild_reference(p, parent)
+    if not version_of(p, ref_id) or not version_of(p, ref_id).get("mesh"):
+        raise ValueError("The reference must be a mesh version")
+    code = str(request.get("code") or "")
+    if not code.strip():
+        raise ValueError("No program to build")
+    tol = float(request.get("tolerance") or (p.get("rebuild") or {}).get("tol") or cfg.get("rebuild_tolerance", 0.5))
+    label = str(request.get("label") or "Rebuild · Claude (chat)")[:60]
+    update_job(jid, phase=f"{label}: building")
+    rebuild_commit(cfg, p, pid, jid, ref_id, code, f"[{label}] {str(request.get('message') or 'New CAD from Claude.')[:2000]}", label, tol)
+
+
 def job_run(jid, pid, request, cfg):
     try:
         p = read_project(pid)
@@ -1528,6 +1800,19 @@ def job_run(jid, pid, request, cfg):
             import_turn(cfg, request, p, pid, jid, parent)
         elif request.get("kind") == "polish":
             polish_turn(cfg, {"tool": "polish", "strength": request.get("strength")}, p, pid, jid, parent)
+        elif request.get("kind") == "rebuild":
+            rebuild_turn(cfg, request, p, pid, jid, parent, str(request.get("model") or ""))
+        elif request.get("kind") == "rebuild_build":
+            rebuild_build_turn(cfg, request, p, pid, jid, parent)
+        elif request.get("kind") == "measure":
+            ref_id = request.get("reference") or rebuild_reference(p, parent)
+            update_job(jid, phase="Measuring the mesh (sections, bands, holes)")
+            measure_mesh(cfg, pid, ref_id)
+            rb = p.setdefault("rebuild", {})
+            if rb.get("reference") != ref_id:
+                rb.clear()
+                rb.update(reference=ref_id, tol=float(cfg.get("rebuild_tolerance", 0.5)))
+            save_project(p)
         elif request.get("kind") == "printable":
             if not parent:
                 raise ValueError("Generate a design first")
@@ -1613,7 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def reply(self, value, status=200, content_type="application/json"):
-        raw = json.dumps(value).encode() if content_type == "application/json" else value
+        raw = value if isinstance(value, (bytes, bytearray)) else json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
@@ -1820,6 +2105,23 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["planner"] = bool(obj["planner"])
                 if obj.get("team_reviewer"):
                     cfg["team_reviewer"] = str(obj["team_reviewer"])[:80]
+                if obj.get("rebuild_engine") in REBUILD_ENGINES:
+                    cfg["rebuild_engine"] = obj["rebuild_engine"]
+                if "rebuild_rounds" in obj:
+                    cfg["rebuild_rounds"] = max(0, min(5, int(obj["rebuild_rounds"])))
+                if "claude_rounds" in obj:
+                    cfg["claude_rounds"] = max(0, min(5, int(obj["claude_rounds"])))
+                if "rebuild_tolerance" in obj:
+                    if not 0.05 <= float(obj["rebuild_tolerance"]) <= 5:
+                        raise ValueError("Use a rebuild tolerance between 0.05 and 5 mm")
+                    cfg["rebuild_tolerance"] = float(obj["rebuild_tolerance"])
+                if obj.get("claude_model") in CLAUDE_MODELS:
+                    cfg["claude_model"] = obj["claude_model"]
+                if "claude_api_key" in obj:  # "" clears it; the key is never sent back to the browser
+                    key = str(obj["claude_api_key"] or "").strip()
+                    if key and not re.fullmatch(r"sk-ant-[A-Za-z0-9_\-]{20,300}", key):
+                        raise ValueError("That doesn't look like an Anthropic API key (it starts with sk-ant-)")
+                    cfg["claude_api_key"] = key
                 bed = obj.get("bed", cfg["bed"])
                 if len(bed) != 3 or not all(1 <= float(x) <= 5000 for x in bed):
                     raise ValueError("Enter three valid bed dimensions")

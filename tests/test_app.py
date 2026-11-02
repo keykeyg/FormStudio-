@@ -607,6 +607,140 @@ class Integration(unittest.TestCase):
         app.commit_version(pr,folder,'',meta,'Mesh from TRELLIS.2','TRELLIS.2',None)
         return p['id']
 
+    CLEAN = ('Replaced the traced outline with a box, a window and an exact hole.\n```python\nimport cadquery as cq\nLENGTH = 60.0\nWIDTH = 40.0\n'
+             'THICKNESS = 8.0\nresult = cq.Workplane("XY").box(LENGTH, WIDTH, THICKNESS).translate((0, 0, THICKNESS / 2))\n'
+             'result = result.faces(">Z").workplane().pushPoints([(15, 0)]).hole(6)\n'
+             'result = result.cut(cq.Workplane("XY").center(-12, 0).rect(16, 20).extrude(20).translate((0, 0, -5)))\n```')
+
+    def plate_mesh_project(self):
+        """A mesh version of a plate with a window and a 6 mm hole, as a scan or TRELLIS.2 would give."""
+        import cadquery as cq
+        body = cq.Workplane("XY").box(60, 40, 8).translate((0, 0, 4)).edges(">Z").chamfer(2).faces(">Z").workplane().pushPoints([(15, 0)]).hole(6)
+        body = body.cut(cq.Workplane("XY").center(-12, 0).rect(16, 20).extrude(20).translate((0, 0, -5)))
+        p = self.request('/api/projects', {})
+        pr = app.read_project(p['id'])
+        folder = app.project_path(p['id']) / ('v-' + 'c' * 12); folder.mkdir(parents=True)
+        cq.exporters.export(body, str(folder / 'model.stl'), tolerance=0.01, angularTolerance=0.05)
+        from preview_render import render_views
+        render_views(folder / 'model.stl', folder)
+        meta = {'dimensions': [60.0, 40.0, 8.0], 'volume': 17000.0, 'solids': 1, 'valid': True, 'mesh': True, 'faces': 500,
+                'solid_boxes': [[-30, 30, -20, 20, 0, 8]]}
+        app.commit_version(pr, folder, '', meta, 'Mesh from TRELLIS.2', 'TRELLIS.2', None)
+        return p['id'], folder.name
+
+    def settings_with(self, **values):
+        saved = json.loads((app.DATA / 'settings.json').read_text())
+        app.atomic(app.DATA / 'settings.json', {**saved, **values})
+        return saved
+
+    def test_rebuild_as_cad_measured_then_local_model(self):
+        pid, mesh_vid = self.plate_mesh_project()
+        saved = self.settings_with(rebuild_rounds=1)
+        try:
+            MockLM.requests.clear(); MockLM.replies[:] = [self.CLEAN]
+            r = self.wait(pid, {'kind': 'rebuild', 'engine': 'local', 'model': 'test-vision', 'tolerance': 0.05})
+            self.assertEqual(r['status'], 'done', r.get('error'))
+            p = r['project']
+            measured, refined = p['versions'][1], p['versions'][2]
+            self.assertEqual(measured['model'], 'Rebuild · measured'); self.assertFalse(measured.get('mesh'))
+            self.assertEqual(measured['rebuild']['reference'], mesh_vid)
+            self.assertGreater(app.project_path(pid).joinpath(measured['id'], 'model.step').stat().st_size, 1000)  # real CAD
+            for a, b in zip(measured['dimensions'], [60, 40, 8]):
+                self.assertAlmostEqual(a, b, delta=0.1)
+            self.assertTrue(refined['model'].startswith('Rebuild · '))
+            self.assertEqual(refined['parameters']['THICKNESS'], 8.0)
+            self.assertEqual(len(MockLM.requests), 1)
+            prompt = MockLM.requests[0]['messages'][-1]['content']
+            self.assertIn('MESH MEASUREMENTS', prompt[0]['text']); self.assertIn('DEVIATION', prompt[0]['text'])
+            self.assertIn('Round hole 6 mm along Z', prompt[0]['text'].replace('6.0 mm', '6 mm'))
+            self.assertTrue(any(x.get('type') == 'image_url' for x in prompt))
+            self.assertEqual(p['rebuild']['reference'], mesh_vid); self.assertEqual(p['active'], p['rebuild']['best'])
+            self.assertIn('Rebuild as CAD: version', p['messages'][-1]['text'])
+            # The chat planner routes "rebuild it as CAD" on a mesh too (no planner model call)
+            self.request('/api/projects/' + pid + '/restore', {'version': mesh_vid})
+            MockLM.requests.clear(); MockLM.replies[:] = ['APPROVED']
+            r = self.wait(pid, {'message': 'rebuild this as CAD', 'model': 'test-vision'})
+            self.assertEqual(r['status'], 'done', r.get('error'))
+            self.assertEqual(r['project']['versions'][-1]['model'], 'Rebuild · measured')
+        finally:
+            app.atomic(app.DATA / 'settings.json', saved)
+
+    def test_rebuild_with_claude_api(self):
+        class MockClaude(BaseHTTPRequestHandler):
+            calls = []
+            def log_message(self, *a):
+                pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                MockClaude.calls.append((dict(self.headers), body))
+                events = [{'type': 'message_start', 'message': {'id': 'm1'}},
+                          {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': Integration.CLEAN[:60]}},
+                          {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': Integration.CLEAN[60:]}},
+                          {'type': 'message_stop'}]
+                raw = ''.join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+                self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.send_header('Content-Length', str(len(raw)))
+                self.end_headers(); self.wfile.write(raw)
+        mock = ThreadingHTTPServer(('127.0.0.1', 0), MockClaude)
+        threading.Thread(target=mock.serve_forever, daemon=True).start()
+        key = 'sk-ant-api03-' + 'k' * 40
+        saved = self.settings_with(claude_url=f'http://127.0.0.1:{mock.server_port}')
+        try:
+            cfg = self.request('/api/config', {'claude_api_key': key, 'claude_rounds': 1, 'rebuild_rounds': 0, 'claude_model': 'claude-opus-5-5'})
+            self.assertNotIn('claude_api_key', cfg); self.assertTrue(cfg['claude_api_key_set'])
+            self.assertNotIn(key, json.dumps(self.request('/api/config')))
+            with self.assertRaises(urllib.error.HTTPError):
+                self.request('/api/config', {'claude_api_key': 'not-a-key'})
+            pid, mesh_vid = self.plate_mesh_project()
+            MockLM.requests.clear()
+            r = self.wait(pid, {'kind': 'rebuild', 'engine': 'api', 'model': 'test-vision', 'tolerance': 0.05})
+            self.assertEqual(r['status'], 'done', r.get('error'))
+            self.assertEqual(len(MockLM.requests), 0)  # local rounds were set to 0
+            headers, body = MockClaude.calls[-1]
+            self.assertEqual(headers.get('x-api-key'), key); self.assertEqual(headers.get('anthropic-version'), '2023-06-01')
+            self.assertEqual(body['model'], 'claude-opus-5-5'); self.assertTrue(body['stream'])
+            self.assertIn('rebuild a scanned or AI-generated mesh', body['system'])
+            blocks = body['messages'][0]['content']
+            self.assertTrue(any(b['type'] == 'image' and b['source']['type'] == 'base64' for b in blocks))
+            self.assertEqual(r['project']['versions'][-1]['model'], 'Rebuild · Claude Opus 5.5')
+            self.assertIn('Claude Opus 5.5 via the API', r['project']['messages'][-1]['text'])
+            cfg = self.request('/api/config', {'claude_api_key': ''})
+            self.assertFalse(cfg['claude_api_key_set'])
+        finally:
+            app.atomic(app.DATA / 'settings.json', saved)
+            mock.shutdown(); mock.server_close()
+
+    def test_claude_connector_mcp(self):
+        import subprocess
+        pid, mesh_vid = self.plate_mesh_project()
+        name = 'Connector plate'
+        pr = app.read_project(pid); pr['name'] = name; app.save_project(pr)
+        code = self.CLEAN.split('```python\n')[1].split('```')[0]
+        msgs = [{'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 't'}}},
+                {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+                {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'get_rebuild_context', 'arguments': {'project': 'connector'}}},
+                {'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {'name': 'build_and_compare', 'arguments': {'project': pid, 'code': code, 'message': 'Clean box, window and hole.'}}},
+                {'jsonrpc': '2.0', 'id': 5, 'method': 'tools/call', 'params': {'name': 'build_and_compare', 'arguments': {'project': pid, 'code': 'result = 1/0'}}},
+                {'jsonrpc': '2.0', 'id': 6, 'method': 'nope'}]
+        r = subprocess.run([sys.executable, '-B', str(Path(app.__file__).parent / 'formstudio_mcp.py')], input='\n'.join(map(json.dumps, msgs)) + '\n',
+                           capture_output=True, text=True, timeout=240, env={**os.environ, 'FORM_STUDIO_URL': self.base})
+        out = {m['id']: m for m in map(json.loads, r.stdout.splitlines())}
+        self.assertEqual(sorted(out), [1, 2, 3, 4, 5, 6], r.stderr)
+        self.assertEqual(out[1]['result']['serverInfo']['name'], 'form-studio')
+        self.assertIn('build_and_compare', [t['name'] for t in out[2]['result']['tools']])
+        ctx = out[3]['result']['content']
+        self.assertNotIn('isError', out[3]['result'])
+        self.assertIn('MESH MEASUREMENTS', ctx[0]['text']); self.assertIn("Form Studio's measured baseline", ctx[0]['text'])
+        self.assertTrue(any(c['type'] == 'image' and c['mimeType'] == 'image/png' for c in ctx))
+        built = out[4]['result']
+        self.assertNotIn('isError', built, built); self.assertIn('DEVIATION', built['content'][0]['text'])
+        self.assertTrue(out[5]['result']['isError']); self.assertIn("didn't build", out[5]['result']['content'][0]['text'])
+        self.assertEqual(out[6]['error']['code'], -32601)
+        p = app.read_project(pid)
+        v = p['versions'][-1]
+        self.assertEqual(v['model'], 'Rebuild · Claude (chat)'); self.assertEqual(v['rebuild']['reference'], mesh_vid)
+        self.assertEqual(p['rebuild']['best'], v['id'])
+
     def test_hole_repair_keeps_the_original_surface(self):
         import subprocess, sys, trimesh, numpy as np
         ball=trimesh.creation.icosphere(5,1.0)

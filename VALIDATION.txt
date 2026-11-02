@@ -83,3 +83,9 @@ In the container: 33 integration tests pass (mock LM Studio, mock ComfyUI, fake 
 - Stair-steps traced to Form Studio's own hole repair, not TRELLIS.2. On a B&T stock (a real TRELLIS.2 1024-cascade output, 197k triangles, 9,890 loose pieces, not watertight), the old 1/400 voxel rebuild sat 1.38 mm (mean) from TRELLIS.2's surface, with 65% of its area facing straight along an axis (the raw mesh: 51%). The new fine rebuild with snapping: 0.30 mm, 51%. Renders showed the terraces gone and the grooves and ribs kept. 216 mm long: ~40 s and 4.8 GB RAM in the container.
 - Polish on that old stepped version: rebuilt from raw.glb (Faithful) ~55 s; smoothing-only (no original) ~11 s, which loses the grooves at Smoother/Smoothest on such coarse steps, so the original is always used when the version chain allows it.
 In the container: 36 integration tests pass (mock LM Studio, mock ComfyUI, fake bambu-studio).
+
+1.7 (Nov 1, 2026): Rebuild as CAD (local, then Claude app, then Claude API), Claude connector.
+- Measuring a B&T stock mesh (115 x 216 x 24 mm, 200k triangles, TRELLIS.2 + Polish): 6 s. It picked Z with 8 bands (windows, grooves, raised rails, stepped end block). The measured CAD built in 2 s as one valid solid and was 91% within ±0.5 mm of the mesh (mean 0.18 mm, 95% within 0.67 mm). The leftover is mostly rounded edges the flat bands overshoot (EXTRA, typically 0.7 mm).
+- Synthetic part (plate with a window, a hole, a boss and a cross hole): 99% within ±0.3 mm (mean 0.09 mm).
+- Fixed along the way: /files served .json with the wrong encoder (HTTP 400).
+In the container: 39 integration tests pass (mock LM Studio, mock ComfyUI, mock Claude API, fake bambu-studio).

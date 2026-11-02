@@ -50,6 +50,7 @@ No cloud, no accounts, no telemetry. Photos, models and history stay in a folder
 | **Slice → Bambu** | Slices with Bambu Studio's command line and its own X2D presets, then opens the sliced plate in Bambu Studio so you can press Print. You get the exact time and grams. |
 | **Mesh mode** | Photo → TRELLIS.2 (ComfyUI) → repaired, real-size mesh. |
 | **CAD edits on meshes** | Ask for holes, slots, flat bases or tabs on a sculpted mesh. The model writes CAD cut/add solids and Form Studio applies them as exact mesh booleans. |
+| **Rebuild as CAD** | Turns a mesh (TRELLIS.2, an import or a 3D scan) into an editable CAD part with a STEP file. Form Studio measures the mesh and builds a CAD version from the measurements. Your local model then cleans it up and fixes where it misses, and every version is checked against the mesh. Optional Claude passes run through the Claude app or the API. |
 | **Polish** | Smooths stair-steps and bumps out of a mesh without changing its size. For TRELLIS.2 meshes it rebuilds from TRELLIS.2's own surface, so detail is kept. |
 | **Mesh size fields** | Sculpted and imported models get X / Y / Z size boxes with **Keep proportions**. Type 216 mm and it scales right away, with no AI involved. |
 | **Planner** | On meshes, your chat is routed to the right tool: resize, stretch one section, move a part, cut/add material, ask a question, or just answer. "The 912 mm needs to be 216" or "make it 180 mm long" are handled instantly by rules; anything else goes through a short text-only call to the local model. |
@@ -265,6 +266,44 @@ Turn on **⚖ Team** and send a request. Form Studio then:
 
 Both versions are kept. The reviewer's version becomes current unless it measures worse. Team review applies to CAD designs; meshes go through the planner.
 
+### Rebuild as CAD (mesh or scan → editable CAD)
+
+Polish makes a mesh smooth. **Rebuild as CAD** makes it a real CAD part: true flats, exact round holes, a STEP file, and sizes you can edit. With a mesh version active, open **Dimensions → Rebuild as CAD** and click **⟲ Rebuild as CAD**, or say "rebuild this as CAD" in chat.
+
+1. **Measure** (`mesh_measure.py`, no AI). Form Studio slices the mesh along X, Y and Z (24 slices each) and picks the direction whose cross-sections stay most alike. Slices with the same outline are grouped into bands of up to 8, and each band's edges are found by bisection. Round openings are fitted as exact circles, and holes that run across the bands are tracked through the slices.
+2. **Measured CAD.** From those measurements Form Studio writes a working CadQuery program:
+   - each band is an extruded outline with its openings cut through
+   - holes are exact cylinders
+   - everything stays in the mesh's own coordinates
+   
+   It's built, then compared with the mesh.
+3. **Check against the mesh.** Both surfaces are sampled (60k points each) and the signed distance is measured both ways. The report gives the share within tolerance (default ±0.5 mm), the mean, and the 95th percentile. It also lists each place where the CAD has **missing** or **extra** material, with its X/Y/Z range, area and size.
+4. **Refine.** Who refines it is chosen in the box, in this order of preference:
+   - **Local only** (the default): your loaded model gets the measurements, the program, the deviation report and two renders (mesh and CAD), and rewrites it as a clean parametric part. Default: 2 rounds.
+   - **Local, then Claude in the Claude app**: the same local pass, then **Copy prompt for Claude** and paste it into the Claude app. Claude uses the Form Studio connector (below) on your normal Claude plan.
+   - **Local, then Claude API**: after the local pass, if it still isn't within tolerance, Form Studio calls Claude through the Anthropic API (Opus 5.5 by default, Sonnet 5.5 cheaper). It needs an API key from console.anthropic.com. API use is billed per use, separately from a Claude Pro plan.
+
+Every candidate is kept as a version with its fit, for example "91% of the surface within ±0.5 mm (mean 0.18 mm)". The closest one becomes active. **Keep refining** runs more rounds from the best version. Once it's CAD, chat edits it like any other design ("make the holes 6.5 mm").
+
+Measured on the B&T stock (115 × 216 × 24 mm TRELLIS.2 mesh): 8 bands along Z, with the windows, grooves and raised rails rebuilt. The measured CAD alone was 91% within ±0.5 mm (mean 0.18 mm), measured in about 6 s.
+
+**Settings → Rebuild as CAD**: default engine, local rounds, match tolerance, Claude model, Claude API rounds, and the API key. The key is stored only in `data/settings.json` on the PC and never sent to the browser. It's sent only to api.anthropic.com, and only when the API engine runs.
+
+### Claude connector (Claude app ↔ Form Studio)
+
+`formstudio_mcp.py` is a standard-library MCP server. Claude Desktop, Claude Code, or a Claude chat linked to this PC can use it to work on your designs while Form Studio is open:
+
+| Tool | What it does |
+|---|---|
+| `list_projects` | your recent designs and their active versions |
+| `get_design` | a version's size, CadQuery source, recent messages and renders |
+| `get_rebuild_context` | the mesh measurements, the best CAD so far (or the measured program) with its deviation report, and renders |
+| `build_and_compare` | builds a program, checks it against the mesh, and keeps it as a new version ("Rebuild · Claude (chat)") |
+| `start_rebuild`, `job_status` | run Form Studio's own rebuild |
+| `set_active_version` | switch versions |
+
+To connect it, double-click **Connect-Claude.cmd**. It adds `form-studio` to Claude Desktop's config next to your other connectors, after backing up the config. Then fully quit Claude Desktop and reopen it. Changes Claude makes show up live in Form Studio.
+
 ### Progress meter
 
 While a local model works, the status box shows the stage and the numbers:
@@ -292,6 +331,8 @@ Windows may ask once to allow Form Studio through the firewall; allow Private ne
 - The server binds to **127.0.0.1 only**. It listens on the network only when phone access is on *and* a passcode is set.
 - Every write request needs a per-run token. The server also checks Origin, and loopback clients must use a loopback Host name, which blocks DNS-rebinding pages.
 - Phone sessions use an HttpOnly, SameSite=Strict cookie stored as a SHA-256 hash, with a PBKDF2 passcode hash. Five wrong tries lock a device out for 10 minutes. **Settings can only be changed on the PC.**
+- The Anthropic API key (optional) is kept in `data/settings.json`, never returned to the browser, and only sent to the Claude API when you choose that engine.
+- The Claude connector only talks to Form Studio on 127.0.0.1 with the same per-run token as the app.
 - Strict Content-Security-Policy, `nosniff`, `frame-ancestors 'none'`.
 - Generated CAD runs in a separate worker that limits imports to `cadquery` and `math`, checks an AST allowlist of statements and attributes, removes general-purpose builtins, and has a 120 s timeout. **This reduces accidental damage; it is not an OS sandbox for hostile code.** Run Form Studio under a normal, non-administrator account.
 
@@ -309,6 +350,9 @@ mesh_mode.py           ComfyUI / TRELLIS.2 runner + editor→API workflow conver
 mesh_worker.py         repair and scale TRELLIS meshes
 mesh_ops.py            mesh tools: CAD booleans, scale, stretch, STL/3MF import (stdlib 3MF reader), part assembly
 design_tools.py        the planner: rules, prompt, JSON checks, part placement
+mesh_measure.py        Rebuild as CAD: sections, bands, holes, the measured program, CAD-vs-mesh deviation
+formstudio_mcp.py      Claude connector (MCP over stdio, standard library only)
+connect_claude.py      adds the connector to Claude Desktop's config (Connect-Claude.cmd runs it)
 templates/             part templates (plain CadQuery)
 workflows/             TRELLIS.2 workflow
 static/                UI: index.html, app.js, viewer.js (WebGL STL viewer + picking), style.css
@@ -335,6 +379,7 @@ The suite runs with a mock LM Studio server, a mock ComfyUI and a fake `bambu-st
 - Mesh mode, editor-workflow conversion, mesh CAD edits and their parameter rebuilds
 - the snapped hole repair, Polish (with and without TRELLIS.2's original), resize/stretch/import/combine, the planner and team review
 - the progress meter (reading estimate, then remembered speed)
+- Rebuild as CAD (measured CAD + local round, the Claude API engine against a mock API, key handling) and the Claude connector over stdio
 - all templates, reference-card detection on a synthetic tilted photo
 - Variations ranking, scheduling and cancel
 - Bambu preset flattening and slicing, fit rules, project delete

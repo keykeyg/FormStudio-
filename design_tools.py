@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import re
 
-TOOLS = {"resize", "scale", "stretch", "place", "polish", "cad", "ask", "answer"}
+TOOLS = {"resize", "scale", "stretch", "place", "polish", "rebuild", "cad", "ask", "answer"}
 UNIT = {"mm": 1.0, "cm": 10.0, "in": 25.4, "inch": 25.4, "inches": 25.4, '"': 25.4}
 NUM = r"(\d+(?:\.\d+)?)\s*(mm|cm|inches|inch|in\b|\")?"
+REBUILD_WORDS = re.compile(r"\b(rebuild|re-?create|convert|turn|remake|model)\b[^.]{0,40}\b(cad|step|parametric|solid model|editable)\b", re.I)
 POLISH_WORDS = re.compile(r"\b(smooth\w*|polish\w*|steppy|stair[- ]?step\w*|stepped|stepping|jagged|rough|bumpy|lumpy|blocky|pixel\w*|terrac\w*)\b", re.I)
 FEATURE_WORDS = re.compile(r"\b(hole|holes|slot|bore|drill|tab|boss|thread|insert|screw|nut|notch|groove|text|logo|rib|lip|pocket|recess|flat|fillet|chamfer|longer|shorter|bigger|smaller|scale|resize|stretch|move|rotate|mm|cm|inch|inches)\b", re.I)
 CAD_WORDS = re.compile(r"\b(hole|holes|slot|bore|cut|drill|tab|boss|fillet|chamfer|flat|recess|pocket|thread|insert|screw|nut|notch|groove|text|logo|rib|lip|add|remove)\b", re.I)
@@ -23,6 +24,7 @@ Pick exactly one tool:
 {"tool":"stretch","axis":"x|y|z","at":MM,"by":MM}  make one section longer (+) or shorter (-) across the plane axis=at, leaving the ends' details as they are. Use for "make the butt 10 mm longer", "shorten the middle by 5". Pick "at" inside that section (use a clicked spot's coordinate if given).
 {"tool":"place","part":"NAME","translate":[x,y,z],"rotate":[rx,ry,rz]}  move or turn one part of a combined design; translate is where the part's bottom-center goes, in mm; rotate in degrees. Omit what doesn't change.
 {"tool":"polish","strength":"light|medium|strong"}  smooth away stair-steps, bumps and roughness on the surface; size stays the same.
+{"tool":"rebuild"}  rebuild the whole mesh as an editable CAD part (measured, then refined and checked against the mesh).
 {"tool":"cad","request":"..."}  anything that adds or removes material at exact sizes: holes, slots, bores, flats, tabs, slots for build plates, chamfers. Restate it precisely in mm and in this part's coordinates.
 {"tool":"ask","question":"..."}  only when you truly cannot act; ask one short question.
 {"tool":"answer","text":"..."}  questions that need no change (e.g. "how long is it?").
@@ -81,6 +83,8 @@ def valid(plan):
         return str(plan.get("axis", "")).lower() in ("x", "y", "z") and num(plan.get("at")) and num(plan.get("by")) and plan["by"] != 0
     if t == "place":
         return isinstance(plan.get("part"), str) and (isinstance(plan.get("translate"), list) or isinstance(plan.get("rotate"), list))
+    if t == "rebuild":
+        return True
     if t == "polish":
         return plan.get("strength") in (None, "light", "medium", "strong")
     if t == "cad":
@@ -94,6 +98,8 @@ def mm(value, unit):
 
 def quick_plan(text, version):
     """Plain size requests, handled without a model. None when the request needs the planner."""
+    if REBUILD_WORDS.search(text):
+        return {"tool": "rebuild"}
     if POLISH_WORDS.search(text) and not FEATURE_WORDS.search(text):
         strong = re.search(r"\b(very|really|super|much|lot|way|strong\w*|heav\w*|fully|completely)\b", text, re.I)
         light = re.search(r"\b(little|bit|slight\w*|light\w*|gentl\w*|touch)\b", text, re.I)
