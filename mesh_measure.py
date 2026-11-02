@@ -16,6 +16,7 @@ import numpy as np
 import trimesh
 
 AXES = "XYZ"
+FORMAT = 2  # bump when the measured program changes, so cached measurements are redone
 PLANE = {0: ("YZ", (1, 2)), 1: ("XZ", (0, 2)), 2: ("XY", (0, 1))}  # extrusion axis -> CadQuery plane, (u, v) axes
 
 
@@ -281,6 +282,10 @@ def program(axis, bands, holes, tol, size):
               "        body = body.cut(disc(cu, cv, d, a0 - 0.01, a1 + 0.01))",
               "    return body", ""]
     names = []
+    lines += ["# >>> MEASURED DATA: outlines measured from the mesh. Keep this block as it is: in a rewrite, put just the line",
+              "#     # MEASURED DATA",
+              "# here and Form Studio puts the block back. To change one list, assign its new value after this block.", ""]
+    cross = [h for h in holes if h["axis"] != AXES[axis]]
     for i, b in enumerate(bands, 1):
         outlines, openings, holes_b, bosses = describe_band(parts_of(b["region"], tol), tol)
         if not outlines and not bosses:
@@ -298,7 +303,10 @@ def program(axis, bands, holes, tol, size):
         lines.append("")
     if not names:
         raise ValueError("No usable cross-section was found in this mesh")
-    lines.append("result = None")
+    if cross:
+        lines += ["# Round holes running across the bands: (axis, center, center, diameter, from, to)",
+                  f"CROSS_HOLES = {json.dumps([[h['axis'], h['u'], h['v'], h['d'], h['start'], h['end']] for h in cross])}"]
+    lines += ["# <<< MEASURED DATA", "", "result = None"]
     for name in names:
         args = [f"*{name}_{A}", f"{name}_OUTLINES"]
         for key in ("OPENINGS", "HOLES", "BOSSES"):
@@ -306,11 +314,8 @@ def program(axis, bands, holes, tol, size):
                 args.append(f"{key.lower()}={name}_{key}")
         lines.append(f"part = band({', '.join(args)})")
         lines.append("result = part if result is None else result.union(part)")
-    cross = [h for h in holes if h["axis"] != A]
     if cross:
-        lines += ["", "# Round holes running across the bands: (axis, center, center, diameter, from, to)",
-                  f"CROSS_HOLES = {json.dumps([[h['axis'], h['u'], h['v'], h['d'], h['start'], h['end']] for h in cross])}",
-                  "for axis, cu, cv, d, a0, a1 in CROSS_HOLES:",
+        lines += ["", "for axis, cu, cv, d, a0, a1 in CROSS_HOLES:",
                   "    plane = {\"X\": \"YZ\", \"Y\": \"XZ\", \"Z\": \"XY\"}[axis]",
                   "    origin = {\"X\": (a0, 0, 0), \"Y\": (0, a1, 0), \"Z\": (0, 0, a0)}[axis]",
                   "    result = result.cut(cq.Workplane(plane, origin=origin).center(cu, cv).circle(d / 2).extrude(a1 - a0))"]
@@ -353,7 +358,7 @@ def measure(path, out):
         a = AXES.index(h["axis"])
         _, (hu, hv) = PLANE[a]
         text.append(f"Round hole {h['d']:g} mm along {h['axis']} at {AXES[hu]} {h['u']:g}, {AXES[hv]} {h['v']:g}, from {h['axis']} {h['start']:g} to {h['end']:g}")
-    result = {"size": size, "bounds": [[round(float(x), 2) for x in lo], [round(float(x), 2) for x in hi]], "axis": AXES[axis],
+    result = {"format": FORMAT, "size": size, "bounds": [[round(float(x), 2) for x in lo], [round(float(x), 2) for x in hi]], "axis": AXES[axis],
               "bands": [{"start": b["start"], "end": b["end"]} for b in bands], "holes": holes, "summary": "\n".join(text), "program": code}
     Path(out).write_text(json.dumps(result, indent=1), encoding="utf-8")
     print(json.dumps({k: result[k] for k in ("size", "axis", "bands", "holes")}))

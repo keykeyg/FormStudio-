@@ -1484,14 +1484,59 @@ Only imports allowed: import cadquery as cq; import math. Assign the finished so
 You get the measurements, the current program (it builds), and a DEVIATION report listing where your CAD has MISSING material (the mesh has it, your CAD doesn't) or EXTRA material (your CAD has it, the mesh doesn't), with coordinates. Fix the biggest regions first and keep everything that already matches.
 Make it read like a designed part: name important sizes as UPPERCASE parameters; where a run of outline points is clearly a straight edge or an arc, you may replace it with that; round holes stay exact circles.
 Where the report shows thin EXTRA material along edges of a band, the mesh's edges are rounded: add small fillets or chamfers last, wrapped in try/except so a failed fillet doesn't lose the part.
-Don't invent features the measurements don't show, and don't move or rescale the part to make the numbers fit.'''
+Don't invent features the measurements don't show, and don't move or rescale the part to make the numbers fit.
+The line "# MEASURED DATA" stands for the measured outline lists (listed in the comments under it). Keep that line exactly where it is in your program:
+Form Studio puts the lists back there. Don't retype outline coordinates; to change one list, assign its new value after that line. Keep your reply short.
+Select edges with simple string selectors such as .edges("|Z"), .edges(">Z") or .faces(">Z").edges(); cq.selectors classes aren't available.'''
+MEASURED_BLOCK = re.compile(r"^# >>> MEASURED DATA.*?^# <<< MEASURED DATA[^\n]*$", re.S | re.M)
+MEASURED_SLOT = re.compile(r"^[ \t]*#[ \t]*MEASURED DATA[ \t]*$", re.M)
+
+
+def condensed_measured(code):
+    """The program as a model sees it: the measured lists replaced by '# MEASURED DATA' and a short index of what's in them,
+    so it can't (and needn't) copy thousands of coordinates."""
+    block = MEASURED_BLOCK.search(code or "")
+    if not block:
+        return code
+    index = ["# MEASURED DATA", "#   (Form Studio inserts the measured lists at the line above. They define:)"]
+    for line in block.group(0).splitlines():
+        m = re.match(r"^([A-Z0-9_]+) = (.*)$", line)
+        if not m:
+            continue
+        name, value = m.groups()
+        if name.endswith(("_OUTLINES", "_OPENINGS")):
+            try:
+                loops = json.loads(value)
+                def box(loop):
+                    us, vs = [q[0] for q in loop], [q[1] for q in loop]
+                    return f"{len(loop)} pts, {min(us):g}..{max(us):g} x {min(vs):g}..{max(vs):g}"
+                index.append(f"#   {name}: {len(loops)} outline(s): " + "; ".join(box(l) for l in loops[:6]) + (" ..." if len(loops) > 6 else ""))
+            except ValueError:
+                index.append(f"#   {name}: (outline lists)")
+        else:
+            index.append(f"#   {name} = {value.split('  #')[0][:300]}")
+    return code[:block.start()] + "\n".join(index) + code[block.end():]
+
+
+def expand_measured(code, source):
+    """Put the measured outlines back where a reply wrote just '# MEASURED DATA'."""
+    block = MEASURED_BLOCK.search(source or "")
+    if block and MEASURED_SLOT.search(code) and not MEASURED_BLOCK.search(code):
+        return MEASURED_SLOT.sub(lambda m: block.group(0), code, count=1)
+    return code
 
 
 def measure_mesh(cfg, pid, ref_id):
     """Measurements of a mesh version (cached in its folder)."""
     folder = project_path(pid) / ref_id
     out = folder / "measure.json"
-    if not out.is_file() or out.stat().st_mtime < (folder / "model.stl").stat().st_mtime:
+    stale = not out.is_file() or out.stat().st_mtime < (folder / "model.stl").stat().st_mtime
+    if not stale:
+        try:
+            stale = json.loads(out.read_text(encoding="utf-8")).get("format", 1) < 2
+        except ValueError:
+            stale = True
+    if stale:
         cmd = [cfg["cad_python"], "-I", "-B", str(ROOT / "mesh_measure.py"), "measure", str(folder / "model.stl"), str(out)]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if r.returncode != 0:
@@ -1626,7 +1671,7 @@ def rebuild_commit(cfg, p, pid, jid, ref_id, code, message, label, tol):
 def rebuild_round(cfg, writer, label, meas, code, dev, note, p, pid, jid, ref_id, tol, images=True):
     """One writer round: show the measurements, program and deviation; build and check what comes back."""
     text = (meas["summary"] + "\n\n" + (f"WHAT THE PERSON WANTS: {note}\n\n" if note else "")
-            + "CURRENT PROGRAM (it builds):\n```python\n" + code + "\n```\n\n" + dev["report"]
+            + "CURRENT PROGRAM (it builds):\n```python\n" + condensed_measured(code) + "\n```\n\n" + dev["report"]
             + f"\nGoal: at least 95% of the surface within ±{tol:g} mm, as a clean parametric program.")
     content = [{"type": "text", "text": text}]
     best = version_of(p, p["rebuild"]["best"])
@@ -1645,8 +1690,9 @@ def rebuild_round(cfg, writer, label, meas, code, dev, note, p, pid, jid, ref_id
             save_project(p)
             return None
         update_job(jid, phase=f"{label}: building")
+        new_code = expand_measured(reply["code"], code)
         try:
-            return rebuild_commit(cfg, p, pid, jid, ref_id, reply["code"], f"[{label}] {reply['message']}", label, tol) + (reply["code"],)
+            return rebuild_commit(cfg, p, pid, jid, ref_id, new_code, f"[{label}] {reply['message']}", label, tol) + (new_code,)
         except (ValueError, SyntaxError) as exc:
             if cancelled(jid):
                 raise Cancelled() from exc
@@ -1735,6 +1781,11 @@ def rebuild_build_turn(cfg, request, p, pid, jid, parent):
     code = str(request.get("code") or "")
     if not code.strip():
         raise ValueError("No program to build")
+    rb = p.get("rebuild") or {}
+    source = (project_path(pid) / rb["best"] / "model.py") if rb.get("best") else None
+    if source is None or not source.is_file():
+        source = None
+    code = expand_measured(code, source.read_text(encoding="utf-8") if source else measure_mesh(cfg, pid, ref_id)["program"])
     tol = float(request.get("tolerance") or (p.get("rebuild") or {}).get("tol") or cfg.get("rebuild_tolerance", 0.5))
     label = str(request.get("label") or "Rebuild · Claude (chat)")[:60]
     update_job(jid, phase=f"{label}: building")

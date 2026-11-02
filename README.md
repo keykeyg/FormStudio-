@@ -285,7 +285,9 @@ Polish makes a mesh smooth. **Rebuild as CAD** makes it a real CAD part: true fl
 
 Every candidate is kept as a version with its fit, for example "91% of the surface within ±0.5 mm (mean 0.18 mm)". The closest one becomes active. **Keep refining** runs more rounds from the best version. Once it's CAD, chat edits it like any other design ("make the holes 6.5 mm").
 
-Measured on the B&T stock (115 × 216 × 24 mm TRELLIS.2 mesh): 8 bands along Z, with the windows, grooves and raised rails rebuilt. The measured CAD alone was 91% within ±0.5 mm (mean 0.18 mm), measured in about 6 s.
+Measured on the B&T stock (115 × 216 × 24 mm TRELLIS.2 mesh): 8 bands along Z, with the windows, grooves and raised rails rebuilt. The measured CAD alone was 91% within ±0.5 mm (mean 0.18 mm), measured in about 6 s. Most of what's left is rounded edges the flat bands overshoot. On that part, Qwen3.8 27B's rounds (about 1.5 min each) didn't improve the fit, so the measured CAD does most of the work. The model rounds are for cleanup and for parts the bands can't capture, and Claude is the step up from there.
+
+The model never retypes the measured outlines. It sees a short index of them (band ranges, outline sizes, holes) and keeps the line `# MEASURED DATA` in its program, and Form Studio puts the outlines back before building. Claude through the connector can do the same.
 
 **Settings → Rebuild as CAD**: default engine, local rounds, match tolerance, Claude model, Claude API rounds, and the API key. The key is stored only in `data/settings.json` on the PC and never sent to the browser. It's sent only to api.anthropic.com, and only when the API engine runs.
 

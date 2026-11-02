@@ -205,7 +205,9 @@ def get_rebuild_context(project=""):
         lines += ["NO CAD YET. Form Studio's measured baseline (it builds; start from it):", "```python", meas["program"], "```"]
     lines += ["", f"HOW TO WORK: keep the mesh's coordinates (X and Y centered, base at Z=0). Send the complete program to build_and_compare; "
               f"it builds it, compares it with the mesh (tolerance ±{tol:g} mm), keeps it as a new version and tells you where material is missing or extra. "
-              "Make it a clean parametric part (UPPERCASE parameters, straight lines and arcs where the outline is straight or round, exact round holes)."]
+              "Make it a clean parametric part (UPPERCASE parameters, straight lines and arcs where the outline is straight or round, exact round holes). "
+              "You don't need to resend the block between '# >>> MEASURED DATA' and '# <<< MEASURED DATA': write the single line '# MEASURED DATA' "
+              "in its place and Form Studio puts the measured outlines back (it uses the best version's block)."]
     content.append(text("\n".join(lines)))
     for v, name, label in ((ref, "view-isometric.png", "Mesh, isometric"), (ref, "view-top.png", "Mesh, top"),
                            (best, "view-isometric.png", "Best CAD so far, isometric")):

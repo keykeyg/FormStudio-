@@ -87,5 +87,6 @@ In the container: 36 integration tests pass (mock LM Studio, mock ComfyUI, fake 
 1.7 (Nov 1, 2026): Rebuild as CAD (local, then Claude app, then Claude API), Claude connector.
 - Measuring a B&T stock mesh (115 x 216 x 24 mm, 200k triangles, TRELLIS.2 + Polish): 6 s. It picked Z with 8 bands (windows, grooves, raised rails, stepped end block). The measured CAD built in 2 s as one valid solid and was 91% within ±0.5 mm of the mesh (mean 0.18 mm, 95% within 0.67 mm). The leftover is mostly rounded edges the flat bands overshoot (EXTRA, typically 0.7 mm).
 - Synthetic part (plate with a window, a hole, a boss and a cross hole): 99% within ±0.3 mm (mean 0.09 mm).
-- Fixed along the way: /files served .json with the wrong encoder (HTTP 400).
-In the container: 39 integration tests pass (mock LM Studio, mock ComfyUI, mock Claude API, fake bambu-studio).
+- On the PC (RTX 3090, Qwen3.8 27B): the same stock rebuilt to the same 91% within ±0.5 mm. The first 27B rounds retyped every outline coordinate (~2,600 tokens at ~10 tokens/s, ~5 min per round), and one used cq.selectors, which the CAD sandbox blocks. Fix: the model now sees a short index of the measured outlines and keeps a "# MEASURED DATA" line that Form Studio expands, so a round is ~1,300 tokens (~1.5 min). On this part 27B's rounds landed at 89-91% (no better than the measured CAD). The best-fitting version stays active, so a weaker round costs nothing.
+- Fixed along the way: /files served .json with the wrong encoder (HTTP 400). Cached measurements are redone when the measured-program format changes.
+In the container: 40 integration tests pass (mock LM Studio, mock ComfyUI, mock Claude API, fake bambu-studio).

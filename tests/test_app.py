@@ -665,6 +665,18 @@ class Integration(unittest.TestCase):
         finally:
             app.atomic(app.DATA / 'settings.json', saved)
 
+    def test_measured_data_placeholder(self):
+        pid, vid = self.plate_mesh_project()
+        meas = app.measure_mesh(app.config(), pid, vid)
+        short = app.MEASURED_BLOCK.sub('# MEASURED DATA', meas['program'])
+        self.assertLess(len(short), len(meas['program']))
+        self.assertEqual(app.expand_measured(short, meas['program']), meas['program'])
+        # Claude through the connector can send the short form; Form Studio puts the outlines back
+        r = self.wait(pid, {'kind': 'rebuild_build', 'code': short, 'reference': vid})
+        self.assertEqual(r['status'], 'done', r.get('error'))
+        self.assertIn('# >>> MEASURED DATA', (app.project_path(pid) / r['project']['active'] / 'model.py').read_text())
+        self.assertGreater(r['project']['versions'][-1]['rebuild']['within'], 0.8)
+
     def test_rebuild_with_claude_api(self):
         class MockClaude(BaseHTTPRequestHandler):
             calls = []
